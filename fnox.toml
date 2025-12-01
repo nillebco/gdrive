@@ -1,0 +1,9 @@
+default_provider = "bitwarden-personal"
+
+[providers.bitwarden-personal]
+type = "bitwarden"
+profile = "Personal"
+backend = "rbw"
+
+[secrets]
+GOOGLE_CREDENTIALS = { value = "drive-cli-client-id-and-secret/notes", provider = "bitwarden-personal" }
