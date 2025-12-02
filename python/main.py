@@ -352,6 +352,76 @@ def export_file(
     return output_path
 
 
+def pull_all(
+    credentials_fpath: Optional[str] = None,
+    token_path: Optional[str] = None,
+    mapping_path: Optional[str] = None,
+) -> list[str]:
+    """Re-export all documents that have been previously exported.
+    
+    Args:
+        credentials_fpath: Path to credentials file
+        token_path: Path to token file
+        mapping_path: Path to files mapping file
+    
+    Returns:
+        List of paths to the re-exported files
+    """
+    mapping = _load_mapping(mapping_path)
+    
+    if not mapping.exports:
+        return []
+    
+    creds = get_credentials(credentials_fpath, token_path)
+    drive = build("drive", "v3", credentials=creds)
+    
+    results = []
+    for file_id, record in mapping.exports.items():
+        # Determine export format from the file extension
+        output_path = record.local_path
+        ext = os.path.splitext(output_path)[1].lstrip('.').lower()
+        export_format = ext if ext in EXPORT_MIME_TYPES else "md"
+        
+        # Get the MIME type for the export format
+        mime_type = EXPORT_MIME_TYPES.get(export_format)
+        if mime_type is None:
+            print(f"Warning: Skipping {output_path} - unsupported format: {export_format}")
+            continue
+        
+        try:
+            # Export the file
+            request = drive.files().export(fileId=file_id, mimeType=mime_type)
+            content = request.execute()
+            
+            # Write to output file
+            text_formats = {"md", "txt", "csv", "tsv", "rtf", "json", "svg"}
+            
+            if export_format in text_formats:
+                with open(output_path, "w", encoding="utf-8") as f:
+                    if isinstance(content, bytes):
+                        f.write(content.decode("utf-8"))
+                    else:
+                        f.write(content)
+            else:
+                with open(output_path, "wb") as f:
+                    if isinstance(content, bytes):
+                        f.write(content)
+                    else:
+                        f.write(content.encode("utf-8"))
+            
+            # Update the timestamp in the mapping
+            record.last_operation = datetime.now(timezone.utc)
+            results.append(output_path)
+        except Exception as e:
+            print(f"Warning: Failed to re-export {output_path}: {e}")
+            continue
+    
+    # Save updated mapping
+    _save_mapping(mapping, mapping_path)
+    
+    return results
+
+
 def share_file(
     fpath: str,
     emails: str,
@@ -1292,6 +1362,65 @@ def share(
             print(f"Shared with {result['emailAddress']} as {result['role']}")
     
     asyncio.run(_share())
+
+
+@app.command()
+def pull(
+    credentials_fpath: Annotated[
+        Optional[str], 
+        typer.Option(
+            "--credentials-fpath", 
+            "-c",
+            help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
+        )
+    ] = None,
+    token_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-path",
+            "-t",
+            help=f"Path to save/load OAuth token. Can also be set via {TOKEN_ENV_VAR} env var. Default: {DEFAULT_TOKEN_PATH}"
+        )
+    ] = None,
+    mapping_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--mapping-path",
+            "-m",
+            help=f"Path to files mapping JSON. Default: {DEFAULT_MAPPING_PATH}"
+        )
+    ] = None,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
+):
+    """Re-export all documents that have been previously exported.
+    
+    This command reads the files mapping and re-exports all documents
+    that were previously exported, updating them with the latest content
+    from Google Drive.
+    
+    Examples:
+        python main.py pull
+        python main.py pull --mapping-path custom-mapping.json
+    """
+    async def _pull():
+        # If token-server is provided, fetch token from server first
+        if token_server:
+            _fetch_token_from_server(token_server, token_path)
+        results = await asyncify(pull_all)(credentials_fpath, token_path, mapping_path)
+        if not results:
+            print("No previously exported documents found.")
+        else:
+            for path in results:
+                print(f"Re-exported: {path}")
+            print(f"\nTotal: {len(results)} document(s) re-exported.")
+    
+    asyncio.run(_pull())
 
 
 @app.command()

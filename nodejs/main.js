@@ -534,6 +534,71 @@ async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFp
 }
 
 /**
+ * Re-export all documents that have been previously exported.
+ * @param {string|null} credentialsFpath - Path to credentials file
+ * @param {string|null} tokenPath - Path to token file
+ * @param {string|null} mappingPath - Path to files mapping file
+ * @returns {Promise<string[]>} Array of paths to re-exported files
+ */
+async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = null) {
+  const mapping = loadMapping(mappingPath);
+  
+  if (!mapping.exports || Object.keys(mapping.exports).length === 0) {
+    return [];
+  }
+  
+  const auth = await getCredentials(credentialsFpath, tokenPath);
+  const drive = google.drive({ version: 'v3', auth });
+  
+  const results = [];
+  
+  for (const [fileId, record] of Object.entries(mapping.exports)) {
+    const outputPath = record.local_path;
+    
+    // Determine export format from the file extension
+    const ext = path.extname(outputPath).slice(1).toLowerCase();
+    const exportFormat = EXPORT_MIME_TYPES[ext] ? ext : 'md';
+    
+    const mimeType = EXPORT_MIME_TYPES[exportFormat];
+    if (!mimeType) {
+      console.error(`Warning: Skipping ${outputPath} - unsupported format: ${exportFormat}`);
+      continue;
+    }
+    
+    try {
+      // Export the file
+      const response = await drive.files.export({
+        fileId,
+        mimeType,
+      }, {
+        responseType: TEXT_FORMATS.has(exportFormat) ? 'text' : 'arraybuffer',
+      });
+      
+      const content = response.data;
+      
+      // Write to output file
+      if (TEXT_FORMATS.has(exportFormat)) {
+        fs.writeFileSync(outputPath, content, 'utf8');
+      } else {
+        fs.writeFileSync(outputPath, Buffer.from(content));
+      }
+      
+      // Update the timestamp in the mapping
+      record.last_operation = new Date().toISOString();
+      results.push(outputPath);
+    } catch (error) {
+      console.error(`Warning: Failed to re-export ${outputPath}: ${error.message}`);
+      continue;
+    }
+  }
+  
+  // Save updated mapping
+  saveMapping(mapping, mappingPath);
+  
+  return results;
+}
+
+/**
  * Share a file on Google Drive with one or more email addresses.
  * @param {string} fpath - Local file path (must have been previously uploaded)
  * @param {string} emails - Email address(es) to share with (comma-separated for multiple)
@@ -699,6 +764,39 @@ program
       
       for (const permission of permissions) {
         console.log(`Shared with ${permission.emailAddress} as ${permission.role}`);
+      }
+    } catch (error) {
+      console.error('Error:', error.message);
+      process.exit(1);
+    }
+  });
+
+// Pull command
+program
+  .command('pull')
+  .description('Re-export all documents that have been previously exported')
+  .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
+  .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
+  .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .action(async (options) => {
+    try {
+      // If token-server is provided, fetch token from server first
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      }
+      const results = await pullAll(
+        options.credentialsFpath,
+        options.tokenPath,
+        options.mappingPath
+      );
+      if (results.length === 0) {
+        console.log('No previously exported documents found.');
+      } else {
+        for (const filePath of results) {
+          console.log(`Re-exported: ${filePath}`);
+        }
+        console.log(`\nTotal: ${results.length} document(s) re-exported.`);
       }
     } catch (error) {
       console.error('Error:', error.message);
@@ -1432,6 +1530,7 @@ export {
   uploadFile,
   exportFile,
   shareFile,
+  pullAll,
   getCredentials,
   loadToken,
   saveToken,

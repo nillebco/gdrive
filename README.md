@@ -13,9 +13,13 @@ Available in both Python and Node.js implementations.
 # Export a Google Doc to Markdown
 ./cli export 1abc123xyz output.md
 
+# Re-export all previously exported documents (sync with latest)
+./cli pull
+
 # Use Node.js implementation instead
 ./cli --node upload document.md
 ./cli --node export 1abc123xyz output.md
+./cli --node pull
 ```
 
 ## Installation
@@ -191,6 +195,46 @@ Export a Google Workspace document (Docs, Sheets, Slides, Drawings) to a local f
 ./cli export 1abc123xyz output.md --token-server http://your-server:8080
 ```
 
+### pull
+
+Re-export all documents that have been previously exported. This is useful for syncing local files with the latest content from Google Drive.
+
+```bash
+./cli [--node] pull [options]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--credentials-fpath` | `-c` | Path to credentials JSON file |
+| `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
+| `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
+| `--token-server` | | URL of token server to fetch OAuth token from |
+
+**Examples:**
+
+```bash
+# Re-export all previously exported documents
+./cli pull
+
+# Re-export using a custom mapping file
+./cli pull --mapping-path my-mapping.json
+
+# Re-export using Node.js implementation
+./cli --node pull
+
+# Re-export using a token server for authentication
+./cli pull --token-server http://your-server:8080
+```
+
+**How it works:**
+
+1. Reads the `exports` section from `files-mapping.json`
+2. For each exported file, downloads the latest version from Google Drive
+3. Writes the content to the same local path as the original export
+4. Updates the `last_operation` timestamp in the mapping
+
 ## Supported Export Formats
 
 | Format | Extension | Document Types |
@@ -249,6 +293,7 @@ This allows:
 
 - **Updating existing files** instead of creating duplicates when you upload the same file again
 - **Tracking** which files have been uploaded and exported
+- **Re-exporting all documents** with a single `pull` command
 - **Timestamps** showing when each operation was last performed
 
 You can specify a custom path with `--mapping-path`.
