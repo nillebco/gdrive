@@ -2,12 +2,47 @@
 # CLI wrapper for gdrive - Google Drive file operations
 # Usage: ./cli [--node] <command> [options]
 #
+# Commands:
+#   install   Create a symlink in ~/.local/bin/gdrivexmd
+#
 # Options:
 #   --node    Use the Node.js implementation instead of Python
 
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks to get the real script location
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  # If $SOURCE is a relative symlink, resolve it relative to the symlink's directory
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# Handle install command
+if [[ "$1" == "install" ]]; then
+  INSTALL_DIR="${HOME}/.local/bin"
+  SYMLINK_NAME="gdrivexmd"
+  SYMLINK_PATH="${INSTALL_DIR}/${SYMLINK_NAME}"
+  
+  mkdir -p "$INSTALL_DIR"
+  ln -sf "$SCRIPT_DIR/cli" "$SYMLINK_PATH"
+  
+  echo "✓ Installed: $SYMLINK_PATH -> $SCRIPT_DIR/cli"
+  
+  # Check if ~/.local/bin is in PATH
+  if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+    echo ""
+    echo "⚠ $INSTALL_DIR is not in your PATH."
+    echo "  Add this line to your ~/.zshrc:"
+    echo ""
+    echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+    echo ""
+    echo "  Then run: source ~/.zshrc"
+  fi
+  exit 0
+fi
 
 USE_NODE=false
 ARGS=()
@@ -30,6 +65,8 @@ if [[ "$USE_NODE" == true ]]; then
   
   exec fnox exec node "$SCRIPT_DIR/nodejs/main.js" "${ARGS[@]}"
 else
+  # Unset VIRTUAL_ENV to avoid warnings about mismatched environments
+  unset VIRTUAL_ENV
   # uv run with --project to specify project location without changing pwd
   exec fnox exec uv run --project "$SCRIPT_DIR/python" python "$SCRIPT_DIR/python/main.py" "${ARGS[@]}"
 fi
