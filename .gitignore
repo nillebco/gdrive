@@ -1,3 +1,2 @@
-.token.json
-.venv/
-__pycache__/
+files-mapping.json
+token.json

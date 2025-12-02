@@ -1,0 +1,22 @@
+{
+  "name": "gdrive-upload",
+  "version": "1.0.0",
+  "description": "Upload files to Google Drive",
+  "type": "module",
+  "main": "main.js",
+  "bin": {
+    "gdrive-upload": "./main.js"
+  },
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "googleapis": "^144.0.0",
+    "open": "^10.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# CLI wrapper for gdrive - Google Drive file operations
+# Usage: ./cli [--node] <command> [options]
+#
+# Options:
+#   --node    Use the Node.js implementation instead of Python
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+USE_NODE=false
+ARGS=()
+
+# Parse arguments, looking for --node flag
+for arg in "$@"; do
+  if [[ "$arg" == "--node" ]]; then
+    USE_NODE=true
+  else
+    ARGS+=("$arg")
+  fi
+done
+
+if [[ "$USE_NODE" == true ]]; then
+  # Install dependencies if node_modules doesn't exist
+  if [[ ! -d "$SCRIPT_DIR/nodejs/node_modules" ]]; then
+    echo "Installing Node.js dependencies..." >&2
+    (cd "$SCRIPT_DIR/nodejs" && npm install --silent)
+  fi
+  
+  exec fnox exec node "$SCRIPT_DIR/nodejs/main.js" "${ARGS[@]}"
+else
+  # uv run with --project to specify project location without changing pwd
+  exec fnox exec uv run --project "$SCRIPT_DIR/python" python "$SCRIPT_DIR/python/main.py" "${ARGS[@]}"
+fi
