@@ -352,6 +352,72 @@ def export_file(
     return output_path
 
 
+def share_file(
+    fpath: str,
+    emails: str,
+    role: str = "reader",
+    notify: bool = True,
+    credentials_fpath: Optional[str] = None,
+    token_path: Optional[str] = None,
+    mapping_path: Optional[str] = None,
+) -> list[dict]:
+    """Share a file on Google Drive with one or more email addresses.
+    
+    Args:
+        fpath: Local file path (must have been previously uploaded)
+        emails: Email address(es) to share with (comma-separated for multiple)
+        role: Permission role ('reader', 'writer', or 'commenter')
+        notify: Whether to send notification email
+        credentials_fpath: Path to credentials file
+        token_path: Path to token file
+        mapping_path: Path to files mapping file
+    
+    Returns:
+        List of created permission metadata
+    """
+    # Load mapping and resolve file path to Drive ID
+    mapping = _load_mapping(mapping_path)
+    abs_path = _get_absolute_path(fpath)
+    
+    existing_record = mapping.uploads.get(abs_path)
+    if not existing_record:
+        raise ValueError(
+            f"File not found in mapping: {fpath}\n"
+            "Make sure the file has been uploaded first using the 'upload' command."
+        )
+    
+    file_id = existing_record.drive_file_id
+    
+    creds = get_credentials(credentials_fpath, token_path)
+    drive = build("drive", "v3", credentials=creds)
+    
+    # Parse comma-separated email addresses
+    email_list = [e.strip() for e in emails.split(",") if e.strip()]
+    
+    if not email_list:
+        raise ValueError("No valid email addresses provided")
+    
+    # Create permissions for each email address
+    results = []
+    for email in email_list:
+        permission = {
+            "type": "user",
+            "role": role,
+            "emailAddress": email,
+        }
+        
+        result = drive.permissions().create(
+            fileId=file_id,
+            body=permission,
+            sendNotificationEmail=notify,
+            fields="id,type,role,emailAddress",
+        ).execute()
+        
+        results.append(result)
+    
+    return results
+
+
 # ============================================================================
 # Token Server Functionality
 # ============================================================================
@@ -1145,6 +1211,87 @@ def export(
         print(f"Exported to: {result}")
     
     asyncio.run(_export())
+
+
+@app.command()
+def share(
+    fpath: Annotated[str, typer.Argument(help="Path to the local file (must have been uploaded)")],
+    emails: Annotated[str, typer.Argument(help="Email address(es) to share with (comma-separated for multiple)")],
+    role: Annotated[
+        str,
+        typer.Option(
+            "--role",
+            "-r",
+            help="Permission role: reader, writer, or commenter"
+        )
+    ] = "reader",
+    notify: Annotated[
+        bool,
+        typer.Option(
+            "--notify/--no-notify",
+            help="Send notification email to the recipient"
+        )
+    ] = True,
+    credentials_fpath: Annotated[
+        Optional[str], 
+        typer.Option(
+            "--credentials-fpath", 
+            "-c",
+            help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
+        )
+    ] = None,
+    token_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-path",
+            "-t",
+            help=f"Path to save/load OAuth token. Can also be set via {TOKEN_ENV_VAR} env var. Default: {DEFAULT_TOKEN_PATH}"
+        )
+    ] = None,
+    mapping_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--mapping-path",
+            "-m",
+            help=f"Path to files mapping JSON. Default: {DEFAULT_MAPPING_PATH}"
+        )
+    ] = None,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
+):
+    """Share an uploaded file with one or more email addresses.
+    
+    Shares a file that has been previously uploaded to Google Drive with
+    one or more email addresses. The file must exist in the local mapping.
+    Multiple emails can be provided as a comma-separated list.
+    
+    Examples:
+        python main.py share document.md user@example.com
+        python main.py share document.md "user1@example.com,user2@example.com"
+        python main.py share document.md user@example.com --role writer
+        python main.py share document.md user@example.com --no-notify
+    """
+    # Validate role
+    valid_roles = ["reader", "writer", "commenter"]
+    if role not in valid_roles:
+        raise typer.BadParameter(
+            f"Invalid role: {role}. Must be one of: {', '.join(valid_roles)}"
+        )
+    
+    async def _share():
+        # If token-server is provided, fetch token from server first
+        if token_server:
+            _fetch_token_from_server(token_server, token_path)
+        results = await asyncify(share_file)(fpath, emails, role, notify, credentials_fpath, token_path, mapping_path)
+        for result in results:
+            print(f"Shared with {result['emailAddress']} as {result['role']}")
+    
+    asyncio.run(_share())
 
 
 @app.command()

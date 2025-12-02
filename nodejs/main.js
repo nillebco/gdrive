@@ -533,6 +533,61 @@ async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFp
   return outputPath;
 }
 
+/**
+ * Share a file on Google Drive with one or more email addresses.
+ * @param {string} fpath - Local file path (must have been previously uploaded)
+ * @param {string} emails - Email address(es) to share with (comma-separated for multiple)
+ * @param {string} role - Permission role ('reader', 'writer', or 'commenter')
+ * @param {boolean} notify - Whether to send notification email
+ * @param {string|null} credentialsFpath - Path to credentials file
+ * @param {string|null} tokenPath - Path to token file
+ * @param {string|null} mappingPath - Path to files mapping file
+ * @returns {Promise<object[]>} Array of created permission metadata
+ */
+async function shareFile(fpath, emails, role = 'reader', notify = true, credentialsFpath = null, tokenPath = null, mappingPath = null) {
+  // Load mapping and resolve file path to Drive ID
+  const mapping = loadMapping(mappingPath);
+  const absPath = getAbsolutePath(fpath);
+  
+  const existingRecord = mapping.uploads[absPath];
+  if (!existingRecord) {
+    throw new Error(`File not found in mapping: ${fpath}\nMake sure the file has been uploaded first using the 'upload' command.`);
+  }
+  
+  const fileId = existingRecord.drive_file_id;
+  
+  const auth = await getCredentials(credentialsFpath, tokenPath);
+  const drive = google.drive({ version: 'v3', auth });
+  
+  // Parse comma-separated email addresses
+  const emailList = emails.split(',').map(e => e.trim()).filter(e => e.length > 0);
+  
+  if (emailList.length === 0) {
+    throw new Error('No valid email addresses provided');
+  }
+  
+  // Create permissions for each email address
+  const results = [];
+  for (const email of emailList) {
+    const permission = {
+      type: 'user',
+      role: role,
+      emailAddress: email,
+    };
+    
+    const response = await drive.permissions.create({
+      fileId: fileId,
+      requestBody: permission,
+      sendNotificationEmail: notify,
+      fields: 'id,type,role,emailAddress',
+    });
+    
+    results.push(response.data);
+  }
+  
+  return results;
+}
+
 // CLI setup
 const program = new Command();
 
@@ -601,6 +656,50 @@ program
         options.mappingPath
       );
       console.log(`Exported to: ${result}`);
+    } catch (error) {
+      console.error('Error:', error.message);
+      process.exit(1);
+    }
+  });
+
+// Share command
+program
+  .command('share')
+  .description('Share an uploaded file with one or more email addresses')
+  .argument('<fpath>', 'Path to the local file (must have been uploaded)')
+  .argument('<emails>', 'Email address(es) to share with (comma-separated for multiple)')
+  .option('-r, --role <role>', 'Permission role: reader, writer, or commenter', 'reader')
+  .option('--no-notify', 'Do not send notification email to the recipient')
+  .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
+  .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
+  .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .action(async (fpath, emails, options) => {
+    try {
+      // Validate role
+      const validRoles = ['reader', 'writer', 'commenter'];
+      if (!validRoles.includes(options.role)) {
+        throw new Error(`Invalid role: ${options.role}. Must be one of: ${validRoles.join(', ')}`);
+      }
+      
+      // If token-server is provided, fetch token from server first
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      }
+      
+      const permissions = await shareFile(
+        fpath,
+        emails,
+        options.role,
+        options.notify,
+        options.credentialsFpath,
+        options.tokenPath,
+        options.mappingPath
+      );
+      
+      for (const permission of permissions) {
+        console.log(`Shared with ${permission.emailAddress} as ${permission.role}`);
+      }
     } catch (error) {
       console.error('Error:', error.message);
       process.exit(1);
@@ -1332,6 +1431,7 @@ program.parse();
 export {
   uploadFile,
   exportFile,
+  shareFile,
   getCredentials,
   loadToken,
   saveToken,
