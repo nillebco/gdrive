@@ -63,10 +63,10 @@ if [[ "$USE_NODE" == true ]]; then
     (cd "$SCRIPT_DIR/nodejs" && npm install --silent)
   fi
   
-  exec fnox exec node "$SCRIPT_DIR/nodejs/main.js" "${ARGS[@]}"
+  exec fnox --config "$SCRIPT_DIR/fnox.toml" exec node "$SCRIPT_DIR/nodejs/main.js" "${ARGS[@]}"
 else
   # Unset VIRTUAL_ENV to avoid warnings about mismatched environments
   unset VIRTUAL_ENV
   # uv run with --project to specify project location without changing pwd
-  exec fnox exec uv run --project "$SCRIPT_DIR/python" python "$SCRIPT_DIR/python/main.py" "${ARGS[@]}"
+  exec fnox --config "$SCRIPT_DIR/fnox.toml" exec uv run --project "$SCRIPT_DIR/python" python "$SCRIPT_DIR/python/main.py" "${ARGS[@]}"
 fi
