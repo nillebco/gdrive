@@ -1,15 +1,22 @@
 import asyncio
 from datetime import datetime, timezone
+import html
+from http.server import BaseHTTPRequestHandler
 import json
 import os
+import secrets
+import socketserver
+import threading
 from typing import Annotated, Optional
+from urllib.parse import parse_qs, urlparse
+import webbrowser
 
 import typer
 from asyncer import asyncify
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials as OAuthCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from pydantic import BaseModel
@@ -20,6 +27,10 @@ CREDENTIALS_ENV_VAR = "GOOGLE_CREDENTIALS"
 TOKEN_ENV_VAR = "GOOGLE_TOKEN"
 DEFAULT_TOKEN_PATH = "token.json"
 DEFAULT_MAPPING_PATH = "files-mapping.json"
+DEFAULT_SERVER_PORT = 8080
+
+# Token server: in-memory store for pending OAuth sessions
+pending_sessions: dict[str, dict] = {}
 
 
 class FileRecord(BaseModel):
@@ -341,6 +352,680 @@ def export_file(
     return output_path
 
 
+# ============================================================================
+# Token Server Functionality
+# ============================================================================
+
+def _generate_landing_page(base_url: str, error: Optional[str] = None) -> str:
+    """Generate the landing page HTML."""
+    error_html = f'<div class="error">{html.escape(error)}</div>' if error else ''
+    
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gdrive — Google Drive CLI Authentication</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {{
+      --bg-dark: #0a0a0f;
+      --bg-card: #12121a;
+      --accent: #00d4aa;
+      --accent-dim: #00a88a;
+      --text-primary: #f0f0f5;
+      --text-secondary: #8888a0;
+      --border: #2a2a3a;
+      --error: #ff4466;
+      --success: #00d4aa;
+    }}
+    
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    
+    body {{
+      font-family: 'Outfit', sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+      background-image: 
+        radial-gradient(circle at 20% 80%, rgba(0, 212, 170, 0.08) 0%, transparent 50%),
+        radial-gradient(circle at 80% 20%, rgba(0, 168, 138, 0.06) 0%, transparent 50%);
+    }}
+    
+    .container {{ max-width: 520px; width: 100%; }}
+    
+    .card {{
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 3rem;
+      text-align: center;
+    }}
+    
+    .logo {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 2.5rem;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 0.5rem;
+      letter-spacing: -0.02em;
+    }}
+    
+    .tagline {{ color: var(--text-secondary); font-size: 1rem; margin-bottom: 2.5rem; }}
+    
+    .steps {{
+      text-align: left;
+      margin-bottom: 2.5rem;
+      padding: 1.5rem;
+      background: rgba(0, 212, 170, 0.04);
+      border-radius: 12px;
+      border: 1px solid rgba(0, 212, 170, 0.1);
+    }}
+    
+    .steps h3 {{
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1rem;
+    }}
+    
+    .step {{
+      display: flex;
+      gap: 1rem;
+      align-items: flex-start;
+      padding: 0.75rem 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }}
+    
+    .step:last-child {{ border-bottom: none; }}
+    
+    .step-num {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: var(--accent);
+      background: rgba(0, 212, 170, 0.15);
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }}
+    
+    .step-text {{ color: var(--text-secondary); font-size: 0.95rem; line-height: 1.5; }}
+    
+    .google-btn {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.75rem;
+      background: #fff;
+      color: #333;
+      font-family: 'Outfit', sans-serif;
+      font-size: 1rem;
+      font-weight: 500;
+      padding: 1rem 2rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+      text-decoration: none;
+    }}
+    
+    .google-btn:hover {{
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    }}
+    
+    .google-btn svg {{ width: 20px; height: 20px; }}
+    
+    .error {{
+      background: rgba(255, 68, 102, 0.1);
+      border: 1px solid rgba(255, 68, 102, 0.3);
+      color: var(--error);
+      padding: 1rem;
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+      font-size: 0.9rem;
+    }}
+    
+    .footer {{ margin-top: 2rem; font-size: 0.8rem; color: var(--text-secondary); }}
+    .footer a {{ color: var(--accent); text-decoration: none; }}
+    .footer a:hover {{ text-decoration: underline; }}
+    code {{
+      font-family: 'JetBrains Mono', monospace;
+      background: rgba(255, 255, 255, 0.08);
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="logo">gdrive</div>
+      <p class="tagline">Command-line Google Drive operations</p>
+      
+      {error_html}
+      
+      <div class="steps">
+        <h3>How it works</h3>
+        <div class="step">
+          <span class="step-num">1</span>
+          <span class="step-text">Click the button below to sign in with your Google account</span>
+        </div>
+        <div class="step">
+          <span class="step-num">2</span>
+          <span class="step-text">Grant access to Google Drive (read & write files)</span>
+        </div>
+        <div class="step">
+          <span class="step-num">3</span>
+          <span class="step-text">Copy the token and use it with the CLI</span>
+        </div>
+      </div>
+      
+      <a href="{base_url}/auth/start" class="google-btn">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+          <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+          <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+          <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+        </svg>
+        Sign in with Google
+      </a>
+      
+      <p class="footer">
+        This token server enables CLI authentication.<br>
+        Learn more at <a href="https://github.com/nillebco/gdrive">github.com/nillebco/gdrive</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>'''
+
+
+def _generate_success_page(token: dict, session_id: str) -> str:
+    """Generate the success page HTML with the token."""
+    token_json = json.dumps(token, indent=2)
+    token_escaped = html.escape(token_json)
+    token_js = json.dumps(token_json)
+    
+    return f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Success — gdrive Authentication</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {{
+      --bg-dark: #0a0a0f;
+      --bg-card: #12121a;
+      --accent: #00d4aa;
+      --accent-dim: #00a88a;
+      --text-primary: #f0f0f5;
+      --text-secondary: #8888a0;
+      --border: #2a2a3a;
+      --success: #00d4aa;
+    }}
+    
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    
+    body {{
+      font-family: 'Outfit', sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+      background-image: 
+        radial-gradient(circle at 20% 80%, rgba(0, 212, 170, 0.08) 0%, transparent 50%),
+        radial-gradient(circle at 80% 20%, rgba(0, 168, 138, 0.06) 0%, transparent 50%);
+    }}
+    
+    .container {{ max-width: 700px; width: 100%; }}
+    
+    .card {{
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 3rem;
+      text-align: center;
+    }}
+    
+    .success-icon {{
+      width: 64px;
+      height: 64px;
+      background: rgba(0, 212, 170, 0.15);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 1.5rem;
+    }}
+    
+    .success-icon svg {{ width: 32px; height: 32px; color: var(--success); }}
+    
+    h1 {{ font-size: 1.75rem; margin-bottom: 0.5rem; }}
+    .subtitle {{ color: var(--text-secondary); margin-bottom: 2rem; }}
+    
+    .token-section {{ text-align: left; margin-bottom: 2rem; }}
+    
+    .token-section h3 {{
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 0.75rem;
+    }}
+    
+    .token-box {{
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      position: relative;
+    }}
+    
+    .token-content {{
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 200px;
+      overflow-y: auto;
+    }}
+    
+    .copy-btn {{
+      position: absolute;
+      top: 0.75rem;
+      right: 0.75rem;
+      background: var(--accent);
+      color: var(--bg-dark);
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }}
+    
+    .copy-btn:hover {{ background: var(--accent-dim); }}
+    .copy-btn.copied {{ background: var(--success); }}
+    
+    .cli-section {{
+      background: rgba(0, 212, 170, 0.04);
+      border: 1px solid rgba(0, 212, 170, 0.1);
+      border-radius: 12px;
+      padding: 1.5rem;
+      text-align: left;
+      margin-bottom: 1.5rem;
+    }}
+    
+    .cli-section h3 {{
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 0.75rem;
+    }}
+    
+    .cli-section p {{ color: var(--text-secondary); font-size: 0.9rem; margin-bottom: 1rem; }}
+    
+    .cli-section code {{
+      display: block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      background: rgba(0, 0, 0, 0.3);
+      padding: 1rem;
+      border-radius: 6px;
+      color: var(--text-primary);
+      overflow-x: auto;
+    }}
+    
+    .done-btn {{
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }}
+    
+    .done-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="success-icon">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+        </svg>
+      </div>
+      
+      <h1>Authentication Successful!</h1>
+      <p class="subtitle">Your Google Drive access token has been generated.</p>
+      
+      <div class="cli-section">
+        <h3>Using with CLI</h3>
+        <p>If you started authentication from the CLI, your token is automatically saved. Otherwise, save the token below to a file named <code style="display: inline; padding: 0.1rem 0.3rem;">token.json</code>:</p>
+        <code>./cli upload document.md</code>
+      </div>
+      
+      <div class="token-section">
+        <h3>Your Token</h3>
+        <div class="token-box">
+          <button class="copy-btn" onclick="copyToken()">Copy</button>
+          <div class="token-content" id="token">{token_escaped}</div>
+        </div>
+      </div>
+      
+      <button class="done-btn" onclick="window.close()">Close Window</button>
+    </div>
+  </div>
+  
+  <script>
+    const token = {token_js};
+    
+    function copyToken() {{
+      navigator.clipboard.writeText(token).then(() => {{
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {{
+          btn.textContent = 'Copy';
+          btn.classList.remove('copied');
+        }}, 2000);
+      }});
+    }}
+  </script>
+</body>
+</html>'''
+
+
+def _fetch_token_from_server(server_url: str, token_path: Optional[str] = None) -> None:
+    """Fetch token from a token server."""
+    from urllib.parse import quote
+    
+    # Check if we already have a valid token
+    existing_token = _load_token(token_path)
+    if existing_token and existing_token.valid:
+        return
+    
+    print(f"Opening browser to authenticate via {server_url}...")
+    
+    # Generate a session ID
+    session_id = secrets.token_hex(16)
+    
+    # Token received flag
+    token_received = threading.Event()
+    received_token = [None]  # Using list to allow modification in nested function
+    
+    class CallbackHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            pass  # Suppress logging
+        
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == '/callback':
+                params = parse_qs(parsed.query)
+                if 'token' in params:
+                    try:
+                        token_data = json.loads(params['token'][0])
+                        received_token[0] = token_data
+                        
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html')
+                        self.end_headers()
+                        self.wfile.write(b'''
+                            <html>
+                                <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                                    <h1>Token received!</h1>
+                                    <p>You can close this window and return to the terminal.</p>
+                                </body>
+                            </html>
+                        ''')
+                        token_received.set()
+                    except Exception as e:
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(f"Error: {e}".encode())
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"No token received")
+    
+    # Start local server on a random port
+    with socketserver.TCPServer(('localhost', 0), CallbackHandler) as httpd:
+        local_port = httpd.server_address[1]
+        callback_url = quote(f"http://localhost:{local_port}/callback")
+        auth_url = f"{server_url}/auth/start?callback={callback_url}&session={session_id}"
+        
+        # Open browser
+        webbrowser.open(auth_url)
+        
+        # Wait for callback with timeout
+        httpd.timeout = 1
+        start_time = datetime.now()
+        timeout = 300  # 5 minutes
+        
+        while not token_received.is_set():
+            httpd.handle_request()
+            if (datetime.now() - start_time).total_seconds() > timeout:
+                raise TimeoutError("Authentication timed out")
+    
+    if received_token[0]:
+        # Save the token
+        path = token_path or DEFAULT_TOKEN_PATH
+        with open(path, 'w') as f:
+            json.dump(received_token[0], f, indent=2)
+        print("Token saved successfully!")
+    else:
+        raise RuntimeError("Failed to receive token")
+
+
+class TokenServerHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the token server."""
+    
+    credentials = None
+    port = DEFAULT_SERVER_PORT
+    
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
+    
+    def _send_html(self, content: str, status: int = 200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(content.encode('utf-8'))
+    
+    def _send_redirect(self, location: str):
+        self.send_response(302)
+        self.send_header('Location', location)
+        self.end_headers()
+    
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        base_url = f"http://localhost:{self.port}"
+        
+        try:
+            # Landing page
+            if parsed.path in ('/', ''):
+                self._send_html(_generate_landing_page(base_url))
+                return
+            
+            # Start OAuth flow
+            if parsed.path == '/auth/start':
+                params = parse_qs(parsed.query)
+                callback = params.get('callback', [None])[0]
+                session_id = params.get('session', [secrets.token_hex(16)])[0]
+                
+                # Store callback URL for this session
+                pending_sessions[session_id] = {
+                    'callback': callback,
+                    'timestamp': datetime.now()
+                }
+                
+                # Clean up old sessions (older than 10 minutes)
+                now = datetime.now()
+                old_sessions = [
+                    sid for sid, sess in pending_sessions.items()
+                    if (now - sess['timestamp']).total_seconds() > 600
+                ]
+                for sid in old_sessions:
+                    del pending_sessions[sid]
+                
+                redirect_uri = f"{base_url}/auth/callback"
+                
+                # Create OAuth flow
+                flow = Flow.from_client_config(
+                    self.credentials,
+                    scopes=SCOPES,
+                    redirect_uri=redirect_uri
+                )
+                
+                auth_url, _ = flow.authorization_url(
+                    access_type='offline',
+                    state=session_id,
+                    prompt='consent'
+                )
+                
+                self._send_redirect(auth_url)
+                return
+            
+            # OAuth callback from Google
+            if parsed.path == '/auth/callback':
+                params = parse_qs(parsed.query)
+                code = params.get('code', [None])[0]
+                state = params.get('state', [None])[0]
+                error = params.get('error', [None])[0]
+                
+                if error:
+                    self._send_html(_generate_landing_page(base_url, f"Google authentication error: {error}"))
+                    return
+                
+                if not code:
+                    self._send_html(_generate_landing_page(base_url, "No authorization code received"))
+                    return
+                
+                redirect_uri = f"{base_url}/auth/callback"
+                
+                try:
+                    # Set environment variable to allow scope changes
+                    # Google may return additional previously-granted scopes
+                    os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
+                    
+                    flow = Flow.from_client_config(
+                        self.credentials,
+                        scopes=SCOPES,
+                        redirect_uri=redirect_uri
+                    )
+                    flow.fetch_token(code=code)
+                    creds = flow.credentials
+                    
+                    # Convert credentials to token dict
+                    token = {
+                        'token': creds.token,
+                        'refresh_token': creds.refresh_token,
+                        'token_uri': creds.token_uri,
+                        'client_id': creds.client_id,
+                        'client_secret': creds.client_secret,
+                        'scopes': list(creds.scopes) if creds.scopes else SCOPES,
+                    }
+                    if creds.expiry:
+                        token['expiry'] = creds.expiry.isoformat()
+                    
+                    # Check if there's a CLI callback waiting
+                    session = pending_sessions.get(state)
+                    if session and session.get('callback'):
+                        from urllib.parse import quote
+                        token_param = quote(json.dumps(token))
+                        callback_url = f"{session['callback']}?token={token_param}"
+                        del pending_sessions[state]
+                        self._send_redirect(callback_url)
+                        return
+                    
+                    # No CLI callback, show success page
+                    if state in pending_sessions:
+                        del pending_sessions[state]
+                    self._send_html(_generate_success_page(token, state or ''))
+                    
+                except Exception as e:
+                    self._send_html(_generate_landing_page(base_url, f"Failed to exchange code for token: {e}"))
+                return
+            
+            # Health check
+            if parsed.path == '/health':
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{"status": "ok"}')
+                return
+            
+            # 404
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"Internal Server Error: {e}".encode())
+
+
+def start_token_server(port: int, credentials_fpath: Optional[str] = None):
+    """Start the OAuth token server."""
+    # Load credentials
+    credentials_json = os.environ.get(CREDENTIALS_ENV_VAR)
+    
+    if credentials_json:
+        credentials = json.loads(credentials_json)
+    elif credentials_fpath and os.path.exists(credentials_fpath):
+        with open(credentials_fpath, 'r') as f:
+            credentials = json.load(f)
+    else:
+        raise ValueError(
+            f"Credentials required. Set {CREDENTIALS_ENV_VAR} env var or use --credentials-fpath"
+        )
+    
+    # Validate credentials
+    creds_data = credentials.get('installed') or credentials.get('web')
+    if not creds_data or not creds_data.get('client_id') or not creds_data.get('client_secret'):
+        raise ValueError("Invalid credentials: missing client_id or client_secret")
+    
+    # Configure handler
+    TokenServerHandler.credentials = credentials
+    TokenServerHandler.port = port
+    
+    # Start server
+    with socketserver.TCPServer(('', port), TokenServerHandler) as httpd:
+        print(f"\n🚀 gdrive token server running at http://localhost:{port}\n")
+        print("Share this URL with users who need to authenticate.")
+        print("Press Ctrl+C to stop the server.\n")
+        
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\nShutting down server...")
+
+
 app = typer.Typer(help="Google Drive file operations")
 
 @app.command()
@@ -379,9 +1064,19 @@ def upload(
             help="Skip upstream modification check and overwrite without prompting"
         )
     ] = False,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
 ):
     """Upload a file to Google Drive."""
     async def _upload():
+        # If token-server is provided, fetch token from server first
+        if token_server:
+            _fetch_token_from_server(token_server, token_path)
         file = await asyncify(upload_file)(fpath, source_mimetype, destination_mimetype, credentials_fpath, token_path, mapping_path, overwrite)
         print(file["id"])
     
@@ -424,6 +1119,13 @@ def export(
             help=f"Path to files mapping JSON. Default: {DEFAULT_MAPPING_PATH}"
         )
     ] = None,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
 ):
     """Export a Google Workspace document to a local file.
     
@@ -436,10 +1138,51 @@ def export(
         python main.py export 1abc123xyz spreadsheet.csv --format csv
     """
     async def _export():
+        # If token-server is provided, fetch token from server first
+        if token_server:
+            _fetch_token_from_server(token_server, token_path)
         result = await asyncify(export_file)(file_id, output_path, format, credentials_fpath, token_path, mapping_path)
         print(f"Exported to: {result}")
     
     asyncio.run(_export())
+
+
+@app.command()
+def server(
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            "-p",
+            help=f"Port to listen on (default: {DEFAULT_SERVER_PORT})"
+        )
+    ] = DEFAULT_SERVER_PORT,
+    credentials_fpath: Annotated[
+        Optional[str],
+        typer.Option(
+            "--credentials-fpath",
+            "-c",
+            help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
+        )
+    ] = None,
+):
+    """Start an OAuth token server for users without their own credentials.
+    
+    This command starts an HTTP server that handles OAuth authentication
+    on behalf of users who don't have their own Google Cloud credentials.
+    
+    Users can visit the server URL, sign in with Google, and receive
+    a token they can use with the CLI.
+    
+    Examples:
+        python main.py server --port 8080
+        python main.py server -c credentials.json
+    """
+    try:
+        start_token_server(port, credentials_fpath)
+    except Exception as e:
+        print(f"Error: {e}")
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

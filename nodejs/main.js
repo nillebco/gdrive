@@ -3,6 +3,7 @@
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
+import crypto from 'crypto';
 import { URL } from 'url';
 import readline from 'readline';
 import open from 'open';
@@ -14,6 +15,10 @@ const CREDENTIALS_ENV_VAR = 'GOOGLE_CREDENTIALS';
 const TOKEN_ENV_VAR = 'GOOGLE_TOKEN';
 const DEFAULT_TOKEN_PATH = 'token.json';
 const DEFAULT_MAPPING_PATH = 'files-mapping.json';
+const DEFAULT_SERVER_PORT = 8080;
+
+// Token server: in-memory store for pending OAuth sessions
+const pendingSessions = new Map();
 
 const MIME_TYPES = {
   pdf: 'application/pdf',
@@ -547,8 +552,13 @@ program
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
   .option('--overwrite', 'Skip upstream modification check and overwrite without prompting')
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
   .action(async (fpath, options) => {
     try {
+      // If token-server is provided, fetch token from server first
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      }
       const file = await uploadFile(
         fpath,
         options.sourceMimetype,
@@ -575,8 +585,13 @@ program
   .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
   .action(async (fileId, outputPath, options) => {
     try {
+      // If token-server is provided, fetch token from server first
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      }
       const result = await exportFile(
         fileId,
         outputPath,
@@ -586,6 +601,725 @@ program
         options.mappingPath
       );
       console.log(`Exported to: ${result}`);
+    } catch (error) {
+      console.error('Error:', error.message);
+      process.exit(1);
+    }
+  });
+
+// ============================================================================
+// Token Server Functionality
+// ============================================================================
+
+/**
+ * Generate the landing page HTML.
+ * @param {string} baseUrl - Base URL of the server
+ * @param {string|null} error - Error message to display, if any
+ * @returns {string} HTML content
+ */
+function generateLandingPage(baseUrl, error = null) {
+  const errorHtml = error ? `<div class="error">${escapeHtml(error)}</div>` : '';
+  
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>gdrive — Google Drive CLI Authentication</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #0a0a0f;
+      --bg-card: #12121a;
+      --accent: #00d4aa;
+      --accent-dim: #00a88a;
+      --text-primary: #f0f0f5;
+      --text-secondary: #8888a0;
+      --border: #2a2a3a;
+      --error: #ff4466;
+      --success: #00d4aa;
+    }
+    
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    body {
+      font-family: 'Outfit', sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+      background-image: 
+        radial-gradient(circle at 20% 80%, rgba(0, 212, 170, 0.08) 0%, transparent 50%),
+        radial-gradient(circle at 80% 20%, rgba(0, 168, 138, 0.06) 0%, transparent 50%);
+    }
+    
+    .container {
+      max-width: 520px;
+      width: 100%;
+    }
+    
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 3rem;
+      text-align: center;
+    }
+    
+    .logo {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 2.5rem;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 0.5rem;
+      letter-spacing: -0.02em;
+    }
+    
+    .tagline {
+      color: var(--text-secondary);
+      font-size: 1rem;
+      margin-bottom: 2.5rem;
+    }
+    
+    .steps {
+      text-align: left;
+      margin-bottom: 2.5rem;
+      padding: 1.5rem;
+      background: rgba(0, 212, 170, 0.04);
+      border-radius: 12px;
+      border: 1px solid rgba(0, 212, 170, 0.1);
+    }
+    
+    .steps h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 1rem;
+    }
+    
+    .step {
+      display: flex;
+      gap: 1rem;
+      align-items: flex-start;
+      padding: 0.75rem 0;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    
+    .step:last-child { border-bottom: none; }
+    
+    .step-num {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: var(--accent);
+      background: rgba(0, 212, 170, 0.15);
+      padding: 0.25rem 0.5rem;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+    
+    .step-text {
+      color: var(--text-secondary);
+      font-size: 0.95rem;
+      line-height: 1.5;
+    }
+    
+    .google-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.75rem;
+      background: #fff;
+      color: #333;
+      font-family: 'Outfit', sans-serif;
+      font-size: 1rem;
+      font-weight: 500;
+      padding: 1rem 2rem;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+      text-decoration: none;
+    }
+    
+    .google-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    }
+    
+    .google-btn svg {
+      width: 20px;
+      height: 20px;
+    }
+    
+    .error {
+      background: rgba(255, 68, 102, 0.1);
+      border: 1px solid rgba(255, 68, 102, 0.3);
+      color: var(--error);
+      padding: 1rem;
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+      font-size: 0.9rem;
+    }
+    
+    .footer {
+      margin-top: 2rem;
+      font-size: 0.8rem;
+      color: var(--text-secondary);
+    }
+    
+    .footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    
+    .footer a:hover { text-decoration: underline; }
+    
+    code {
+      font-family: 'JetBrains Mono', monospace;
+      background: rgba(255, 255, 255, 0.08);
+      padding: 0.2rem 0.4rem;
+      border-radius: 4px;
+      font-size: 0.85em;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="logo">gdrive</div>
+      <p class="tagline">Command-line Google Drive operations</p>
+      
+      ${errorHtml}
+      
+      <div class="steps">
+        <h3>How it works</h3>
+        <div class="step">
+          <span class="step-num">1</span>
+          <span class="step-text">Click the button below to sign in with your Google account</span>
+        </div>
+        <div class="step">
+          <span class="step-num">2</span>
+          <span class="step-text">Grant access to Google Drive (read & write files)</span>
+        </div>
+        <div class="step">
+          <span class="step-num">3</span>
+          <span class="step-text">Copy the token and use it with the CLI</span>
+        </div>
+      </div>
+      
+      <a href="${baseUrl}/auth/start" class="google-btn">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#4285F4"/>
+          <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+          <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+          <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+        </svg>
+        Sign in with Google
+      </a>
+      
+      <p class="footer">
+        This token server enables CLI authentication.<br>
+        Learn more at <a href="https://github.com/nillebco/gdrive">github.com/nillebco/gdrive</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+/**
+ * Generate the success page HTML with the token.
+ * @param {object} token - The OAuth token
+ * @param {string} sessionId - The session ID for CLI retrieval
+ * @returns {string} HTML content
+ */
+function generateSuccessPage(token, sessionId) {
+  const tokenJson = JSON.stringify(token, null, 2);
+  
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Success — gdrive Authentication</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Outfit:wght@400;500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-dark: #0a0a0f;
+      --bg-card: #12121a;
+      --accent: #00d4aa;
+      --accent-dim: #00a88a;
+      --text-primary: #f0f0f5;
+      --text-secondary: #8888a0;
+      --border: #2a2a3a;
+      --success: #00d4aa;
+    }
+    
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    body {
+      font-family: 'Outfit', sans-serif;
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+      background-image: 
+        radial-gradient(circle at 20% 80%, rgba(0, 212, 170, 0.08) 0%, transparent 50%),
+        radial-gradient(circle at 80% 20%, rgba(0, 168, 138, 0.06) 0%, transparent 50%);
+    }
+    
+    .container {
+      max-width: 700px;
+      width: 100%;
+    }
+    
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 3rem;
+      text-align: center;
+    }
+    
+    .success-icon {
+      width: 64px;
+      height: 64px;
+      background: rgba(0, 212, 170, 0.15);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 0 auto 1.5rem;
+    }
+    
+    .success-icon svg {
+      width: 32px;
+      height: 32px;
+      color: var(--success);
+    }
+    
+    h1 {
+      font-size: 1.75rem;
+      margin-bottom: 0.5rem;
+    }
+    
+    .subtitle {
+      color: var(--text-secondary);
+      margin-bottom: 2rem;
+    }
+    
+    .token-section {
+      text-align: left;
+      margin-bottom: 2rem;
+    }
+    
+    .token-section h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 0.75rem;
+    }
+    
+    .token-box {
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      position: relative;
+    }
+    
+    .token-content {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 200px;
+      overflow-y: auto;
+    }
+    
+    .copy-btn {
+      position: absolute;
+      top: 0.75rem;
+      right: 0.75rem;
+      background: var(--accent);
+      color: var(--bg-dark);
+      border: none;
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.8rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s ease;
+    }
+    
+    .copy-btn:hover {
+      background: var(--accent-dim);
+    }
+    
+    .copy-btn.copied {
+      background: var(--success);
+    }
+    
+    .cli-section {
+      background: rgba(0, 212, 170, 0.04);
+      border: 1px solid rgba(0, 212, 170, 0.1);
+      border-radius: 12px;
+      padding: 1.5rem;
+      text-align: left;
+      margin-bottom: 1.5rem;
+    }
+    
+    .cli-section h3 {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--accent);
+      margin-bottom: 0.75rem;
+    }
+    
+    .cli-section p {
+      color: var(--text-secondary);
+      font-size: 0.9rem;
+      margin-bottom: 1rem;
+    }
+    
+    .cli-section code {
+      display: block;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.85rem;
+      background: rgba(0, 0, 0, 0.3);
+      padding: 1rem;
+      border-radius: 6px;
+      color: var(--text-primary);
+      overflow-x: auto;
+    }
+    
+    .done-btn {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 0.75rem 2rem;
+      border-radius: 8px;
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.95rem;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    
+    .done-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="success-icon">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7" />
+        </svg>
+      </div>
+      
+      <h1>Authentication Successful!</h1>
+      <p class="subtitle">Your Google Drive access token has been generated.</p>
+      
+      <div class="cli-section">
+        <h3>Using with CLI</h3>
+        <p>If you started authentication from the CLI, your token is automatically saved. Otherwise, save the token below to a file named <code style="display: inline; padding: 0.1rem 0.3rem;">token.json</code>:</p>
+        <code>./cli upload document.md</code>
+      </div>
+      
+      <div class="token-section">
+        <h3>Your Token</h3>
+        <div class="token-box">
+          <button class="copy-btn" onclick="copyToken()">Copy</button>
+          <div class="token-content" id="token">${escapeHtml(tokenJson)}</div>
+        </div>
+      </div>
+      
+      <button class="done-btn" onclick="window.close()">Close Window</button>
+    </div>
+  </div>
+  
+  <script>
+    const token = ${JSON.stringify(tokenJson)};
+    
+    function copyToken() {
+      navigator.clipboard.writeText(token).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = 'Copy';
+          btn.classList.remove('copied');
+        }, 2000);
+      });
+    }
+  </script>
+</body>
+</html>`;
+}
+
+/**
+ * Escape HTML special characters.
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string
+ */
+function escapeHtml(str) {
+  const map = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;',
+  };
+  return str.replace(/[&<>"']/g, m => map[m]);
+}
+
+/**
+ * Fetch token from a token server.
+ * @param {string} serverUrl - URL of the token server
+ * @param {string|null} tokenPath - Path to save the token
+ * @returns {Promise<void>}
+ */
+async function fetchTokenFromServer(serverUrl, tokenPath = null) {
+  // Check if we already have a valid token
+  const existingToken = loadToken(tokenPath);
+  if (existingToken) {
+    // Token exists, check if it's still valid
+    if (!existingToken.expiry_date || Date.now() < existingToken.expiry_date) {
+      return; // Token is still valid
+    }
+  }
+
+  console.log(`Opening browser to authenticate via ${serverUrl}...`);
+  
+  // Generate a session ID for this CLI instance
+  const sessionId = crypto.randomBytes(16).toString('hex');
+  
+  // Start a local server to receive the token
+  return new Promise((resolve, reject) => {
+    const localServer = http.createServer(async (req, res) => {
+      try {
+        const url = new URL(req.url, 'http://localhost');
+        
+        if (url.pathname === '/callback') {
+          const tokenParam = url.searchParams.get('token');
+          
+          if (tokenParam) {
+            const token = JSON.parse(decodeURIComponent(tokenParam));
+            saveToken(token, tokenPath);
+            
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(`
+              <html>
+                <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+                  <h1>✓ Token received!</h1>
+                  <p>You can close this window and return to the terminal.</p>
+                </body>
+              </html>
+            `);
+            
+            localServer.close();
+            resolve();
+          } else {
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end('No token received');
+            localServer.close();
+            reject(new Error('No token received from server'));
+          }
+        }
+      } catch (error) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Error processing callback');
+        localServer.close();
+        reject(error);
+      }
+    });
+
+    localServer.listen(0, async () => {
+      const port = localServer.address().port;
+      const callbackUrl = encodeURIComponent(`http://localhost:${port}/callback`);
+      const authUrl = `${serverUrl}/auth/start?callback=${callbackUrl}&session=${sessionId}`;
+      
+      await open(authUrl);
+    });
+
+    // Timeout after 5 minutes
+    setTimeout(() => {
+      localServer.close();
+      reject(new Error('Authentication timed out'));
+    }, 5 * 60 * 1000);
+  });
+}
+
+/**
+ * Start the OAuth token server.
+ * @param {number} port - Port to listen on
+ * @param {string|null} credentialsFpath - Path to credentials file
+ * @returns {Promise<void>}
+ */
+async function startTokenServer(port, credentialsFpath = null) {
+  // Load credentials
+  let credentials;
+  const credentialsJson = process.env[CREDENTIALS_ENV_VAR];
+  
+  if (credentialsJson) {
+    credentials = JSON.parse(credentialsJson);
+  } else if (credentialsFpath && fs.existsSync(credentialsFpath)) {
+    credentials = JSON.parse(fs.readFileSync(credentialsFpath, 'utf8'));
+  } else {
+    throw new Error(
+      `Credentials required. Set ${CREDENTIALS_ENV_VAR} env var or use --credentials-fpath`
+    );
+  }
+
+  const { client_id, client_secret } = credentials.installed || credentials.web;
+  if (!client_id || !client_secret) {
+    throw new Error('Invalid credentials: missing client_id or client_secret');
+  }
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, `http://localhost:${port}`);
+    const baseUrl = `http://localhost:${port}`;
+
+    try {
+      // Landing page
+      if (url.pathname === '/' || url.pathname === '') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(generateLandingPage(baseUrl));
+        return;
+      }
+
+      // Start OAuth flow
+      if (url.pathname === '/auth/start') {
+        const callback = url.searchParams.get('callback');
+        const sessionId = url.searchParams.get('session') || crypto.randomBytes(16).toString('hex');
+        
+        // Store callback URL for this session
+        pendingSessions.set(sessionId, { callback, timestamp: Date.now() });
+        
+        // Clean up old sessions (older than 10 minutes)
+        const now = Date.now();
+        for (const [id, session] of pendingSessions.entries()) {
+          if (now - session.timestamp > 10 * 60 * 1000) {
+            pendingSessions.delete(id);
+          }
+        }
+
+        const redirectUri = `${baseUrl}/auth/callback`;
+        const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirectUri);
+        
+        const authUrl = oauth2Client.generateAuthUrl({
+          access_type: 'offline',
+          scope: SCOPES,
+          state: sessionId,
+          prompt: 'consent',
+        });
+
+        res.writeHead(302, { Location: authUrl });
+        res.end();
+        return;
+      }
+
+      // OAuth callback from Google
+      if (url.pathname === '/auth/callback') {
+        const code = url.searchParams.get('code');
+        const state = url.searchParams.get('state');
+        const error = url.searchParams.get('error');
+
+        if (error) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(generateLandingPage(baseUrl, `Google authentication error: ${error}`));
+          return;
+        }
+
+        if (!code) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(generateLandingPage(baseUrl, 'No authorization code received'));
+          return;
+        }
+
+        const redirectUri = `${baseUrl}/auth/callback`;
+        const oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirectUri);
+        
+        try {
+          const { tokens } = await oauth2Client.getToken(code);
+          
+          // Check if there's a CLI callback waiting
+          const session = pendingSessions.get(state);
+          if (session?.callback) {
+            // Redirect to CLI's local server with the token
+            const tokenParam = encodeURIComponent(JSON.stringify(tokens));
+            const callbackUrl = `${session.callback}?token=${tokenParam}`;
+            pendingSessions.delete(state);
+            
+            res.writeHead(302, { Location: callbackUrl });
+            res.end();
+            return;
+          }
+          
+          // No CLI callback, show the success page with token
+          pendingSessions.delete(state);
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(generateSuccessPage(tokens, state));
+        } catch (err) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(generateLandingPage(baseUrl, `Failed to exchange code for token: ${err.message}`));
+        }
+        return;
+      }
+
+      // Health check endpoint
+      if (url.pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ status: 'ok' }));
+        return;
+      }
+
+      // 404 for everything else
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not Found');
+
+    } catch (err) {
+      console.error('Server error:', err);
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('Internal Server Error');
+    }
+  });
+
+  return new Promise((resolve, reject) => {
+    server.on('error', reject);
+    server.listen(port, () => {
+      console.log(`\n🚀 gdrive token server running at http://localhost:${port}\n`);
+      console.log('Share this URL with users who need to authenticate.');
+      console.log('Press Ctrl+C to stop the server.\n');
+      resolve();
+    });
+  });
+}
+
+// Server command
+program
+  .command('server')
+  .description('Start an OAuth token server for users without their own credentials')
+  .option('-p, --port <port>', `Port to listen on (default: ${DEFAULT_SERVER_PORT})`, DEFAULT_SERVER_PORT.toString())
+  .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
+  .action(async (options) => {
+    try {
+      await startTokenServer(parseInt(options.port, 10), options.credentialsFpath);
     } catch (error) {
       console.error('Error:', error.message);
       process.exit(1);
@@ -608,6 +1342,8 @@ export {
   getAbsolutePath,
   promptConfirmation,
   getUpstreamModifiedTime,
+  startTokenServer,
+  fetchTokenFromServer,
   SCOPES,
   MIME_TYPES,
   EXPORT_MIME_TYPES,
@@ -616,4 +1352,5 @@ export {
   TOKEN_ENV_VAR,
   DEFAULT_TOKEN_PATH,
   DEFAULT_MAPPING_PATH,
+  DEFAULT_SERVER_PORT,
 };

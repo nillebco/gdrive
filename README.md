@@ -32,9 +32,23 @@ Dependencies are **automatically installed** on first run:
 
 ## Authentication
 
-The tool supports two authentication methods:
+The tool supports three authentication methods:
 
-### Option 1: OAuth 2.0 (Client Secret)
+### Option 1: Token Server (No Credentials Required)
+
+If someone in your organization runs a token server, you can authenticate without having your own Google Cloud credentials:
+
+```bash
+# Authenticate via token server and upload a file
+./cli upload document.md --token-server http://your-server:8080
+
+# The token is automatically saved for future use
+./cli upload another-doc.md
+```
+
+See [Token Server](#token-server) section for how to run your own server.
+
+### Option 2: OAuth 2.0 (Client Secret)
 
 1. Create OAuth 2.0 credentials in the [Google Cloud Console](https://console.cloud.google.com/apis/credentials)
 2. Download the credentials JSON file
@@ -44,7 +58,7 @@ The tool supports two authentication methods:
 
 On first run, a browser window will open for authentication. The token is saved to `token.json` (or the path specified by `--token-path` / `GOOGLE_TOKEN` env var) for future use.
 
-### Option 2: Service Account
+### Option 3: Service Account
 
 1. Create a service account in the [Google Cloud Console](https://console.cloud.google.com/iam-admin/serviceaccounts)
 2. Download the service account JSON key
@@ -56,6 +70,51 @@ On first run, a browser window will open for authentication. The token is saved 
 ## Commands
 
 > **Tip:** Add `--node` before any command to use the Node.js implementation instead of Python.
+
+### server
+
+Start an OAuth token server that allows users without their own Google Cloud credentials to authenticate.
+
+```bash
+./cli [--node] server [options]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--port` | `-p` | Port to listen on (default: `8080`) |
+| `--credentials-fpath` | `-c` | Path to credentials JSON file |
+
+**Examples:**
+
+```bash
+# Start server on default port 8080
+./cli server
+
+# Start server on custom port
+./cli server --port 3000
+
+# Use specific credentials file
+./cli server -c my-credentials.json
+```
+
+**How it works:**
+
+1. The server operator runs the server with their OAuth credentials
+2. Users visit the server URL (e.g., `http://your-server:8080`)
+3. Users click "Sign in with Google" and authorize the application
+4. The token is displayed for manual copying, or automatically received when using `--token-server`
+
+**Using the server from CLI:**
+
+```bash
+# Authenticate via token server and upload
+./cli upload document.md --token-server http://your-server:8080
+
+# Authenticate via token server and export
+./cli export 1abc123xyz output.md --token-server http://your-server:8080
+```
 
 ### upload
 
@@ -74,6 +133,8 @@ Upload a file to Google Drive. If the same file was previously uploaded, it will
 | `--credentials-fpath` | `-c` | Path to credentials JSON file |
 | `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
 | `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
+| `--token-server` | | URL of token server to fetch OAuth token from |
+| `--overwrite` | | Skip upstream modification check and overwrite without prompting |
 
 **Examples:**
 
@@ -88,6 +149,9 @@ Upload a file to Google Drive. If the same file was previously uploaded, it will
 
 # Upload a PDF
 ./cli upload report.pdf
+
+# Upload using a token server for authentication
+./cli upload document.md --token-server http://your-server:8080
 ```
 
 ### export
@@ -106,6 +170,7 @@ Export a Google Workspace document (Docs, Sheets, Slides, Drawings) to a local f
 | `--credentials-fpath` | `-c` | Path to credentials JSON file |
 | `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
 | `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
+| `--token-server` | | URL of token server to fetch OAuth token from |
 
 **Examples:**
 
@@ -121,6 +186,9 @@ Export a Google Workspace document (Docs, Sheets, Slides, Drawings) to a local f
 
 # Export a Google Doc to PDF
 ./cli export 1abc123xyz document.pdf --format pdf
+
+# Export using a token server for authentication
+./cli export 1abc123xyz output.md --token-server http://your-server:8080
 ```
 
 ## Supported Export Formats
@@ -184,6 +252,42 @@ This allows:
 - **Timestamps** showing when each operation was last performed
 
 You can specify a custom path with `--mapping-path`.
+
+## Token Server
+
+The token server allows users without their own Google Cloud credentials to authenticate through a shared OAuth application. This is useful for teams or organizations where:
+
+- Only a few people have access to Google Cloud Console
+- You want to simplify onboarding for new users
+- You need to provide CLI access to external collaborators
+
+### Setting Up a Token Server
+
+1. **Create OAuth credentials** in Google Cloud Console:
+   - Go to [APIs & Services > Credentials](https://console.cloud.google.com/apis/credentials)
+   - Create an OAuth 2.0 Client ID (Web application type)
+   - Add `http://localhost:8080/auth/callback` to Authorized redirect URIs
+   - For production, also add your server's public URL
+
+2. **Start the server**:
+   ```bash
+   # Using credentials from environment variable
+   export GOOGLE_CREDENTIALS='{"installed":{"client_id":"...","client_secret":"..."}}'
+   ./cli server --port 8080
+
+   # Using credentials from file
+   ./cli server -c credentials.json --port 8080
+   ```
+
+3. **Share the URL** with your users (e.g., `http://your-server:8080`)
+
+### Security Considerations
+
+- The token server only generates OAuth tokens; it doesn't store them
+- Each user gets their own token linked to their Google account
+- Users can revoke access at any time in their [Google Account settings](https://myaccount.google.com/permissions)
+- Consider running behind HTTPS in production
+- The server doesn't require any database or persistent storage
 
 ## Project Structure
 
