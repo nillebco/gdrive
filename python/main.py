@@ -46,9 +46,45 @@ class FilesMapping(BaseModel):
     exports: dict[str, FileRecord] = {}  # keyed by drive_file_id
 
 
+def _find_mapping_file(filename: str = DEFAULT_MAPPING_PATH) -> Optional[str]:
+    """Find the mapping file by searching current directory and parents.
+    
+    Args:
+        filename: The mapping filename to search for
+        
+    Returns:
+        The absolute path to the found mapping file, or None if not found
+    """
+    current = os.path.abspath(os.getcwd())
+    
+    while True:
+        candidate = os.path.join(current, filename)
+        if os.path.exists(candidate):
+            return candidate
+        
+        parent = os.path.dirname(current)
+        if parent == current:
+            # Reached filesystem root
+            break
+        current = parent
+    
+    return None
+
+
 def _load_mapping(mapping_path: Optional[str] = None) -> FilesMapping:
-    """Load the files mapping from disk."""
-    path = mapping_path or DEFAULT_MAPPING_PATH
+    """Load the files mapping from disk.
+    
+    If no explicit path is provided, searches for the mapping file
+    in the current directory and parent directories.
+    """
+    if mapping_path:
+        # Explicit path provided, use it directly
+        path = mapping_path
+    else:
+        # Search for existing mapping file in current and parent directories
+        found_path = _find_mapping_file(DEFAULT_MAPPING_PATH)
+        path = found_path or DEFAULT_MAPPING_PATH
+    
     if os.path.exists(path):
         with open(path, "r") as f:
             data = json.load(f)
@@ -56,9 +92,27 @@ def _load_mapping(mapping_path: Optional[str] = None) -> FilesMapping:
     return FilesMapping()
 
 
+def _get_mapping_path(mapping_path: Optional[str] = None) -> str:
+    """Get the path to use for the mapping file.
+    
+    If no explicit path is provided, searches for an existing mapping file
+    in the current directory and parent directories. If not found,
+    returns the default path in the current directory.
+    """
+    if mapping_path:
+        return mapping_path
+    
+    found_path = _find_mapping_file(DEFAULT_MAPPING_PATH)
+    return found_path or DEFAULT_MAPPING_PATH
+
+
 def _save_mapping(mapping: FilesMapping, mapping_path: Optional[str] = None):
-    """Save the files mapping to disk."""
-    path = mapping_path or DEFAULT_MAPPING_PATH
+    """Save the files mapping to disk.
+    
+    If no explicit path is provided, saves to the found mapping file location
+    (from current or parent directories) or to the default path in the current directory.
+    """
+    path = _get_mapping_path(mapping_path)
     with open(path, "w") as f:
         f.write(mapping.model_dump_json(indent=2))
 

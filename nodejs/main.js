@@ -125,12 +125,49 @@ function createFilesMapping() {
 }
 
 /**
+ * Find the mapping file by searching current directory and parents.
+ * @param {string} filename - The mapping filename to search for
+ * @returns {string|null} The absolute path to the found mapping file, or null if not found
+ */
+function findMappingFile(filename = DEFAULT_MAPPING_PATH) {
+  let current = path.resolve(process.cwd());
+  
+  while (true) {
+    const candidate = path.join(current, filename);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+    
+    const parent = path.dirname(current);
+    if (parent === current) {
+      // Reached filesystem root
+      break;
+    }
+    current = parent;
+  }
+  
+  return null;
+}
+
+/**
  * Load the files mapping from disk.
+ * If no explicit path is provided, searches for the mapping file
+ * in the current directory and parent directories.
  * @param {string|null} mappingPath - Optional path to mapping file
  * @returns {object} FilesMapping object
  */
 function loadMapping(mappingPath = null) {
-  const filePath = mappingPath || DEFAULT_MAPPING_PATH;
+  let filePath;
+  
+  if (mappingPath) {
+    // Explicit path provided, use it directly
+    filePath = mappingPath;
+  } else {
+    // Search for existing mapping file in current and parent directories
+    const foundPath = findMappingFile(DEFAULT_MAPPING_PATH);
+    filePath = foundPath || DEFAULT_MAPPING_PATH;
+  }
+  
   if (fs.existsSync(filePath)) {
     try {
       const content = fs.readFileSync(filePath, 'utf8');
@@ -148,12 +185,31 @@ function loadMapping(mappingPath = null) {
 }
 
 /**
+ * Get the path to use for the mapping file.
+ * If no explicit path is provided, searches for an existing mapping file
+ * in the current directory and parent directories. If not found,
+ * returns the default path in the current directory.
+ * @param {string|null} mappingPath - Optional explicit path
+ * @returns {string} The path to use for the mapping file
+ */
+function getMappingPath(mappingPath = null) {
+  if (mappingPath) {
+    return mappingPath;
+  }
+  
+  const foundPath = findMappingFile(DEFAULT_MAPPING_PATH);
+  return foundPath || DEFAULT_MAPPING_PATH;
+}
+
+/**
  * Save the files mapping to disk.
+ * If no explicit path is provided, saves to the found mapping file location
+ * (from current or parent directories) or to the default path in the current directory.
  * @param {object} mapping - FilesMapping object
  * @param {string|null} mappingPath - Optional path to save mapping
  */
 function saveMapping(mapping, mappingPath = null) {
-  const filePath = mappingPath || DEFAULT_MAPPING_PATH;
+  const filePath = getMappingPath(mappingPath);
   fs.writeFileSync(filePath, JSON.stringify(mapping, null, 2));
 }
 
@@ -1536,6 +1592,8 @@ export {
   saveToken,
   loadMapping,
   saveMapping,
+  findMappingFile,
+  getMappingPath,
   createFileRecord,
   createFilesMapping,
   getAbsolutePath,

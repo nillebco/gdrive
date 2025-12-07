@@ -296,7 +296,13 @@ This allows:
 - **Re-exporting all documents** with a single `pull` command
 - **Timestamps** showing when each operation was last performed
 
-You can specify a custom path with `--mapping-path`.
+### Automatic Discovery
+
+The tool automatically searches for `files-mapping.json` in the current directory and parent directories, similar to how Git finds `.git` folders. This means you can run commands from any subdirectory of your project and it will find and use the correct mapping file.
+
+If no mapping file is found, a new one will be created in the current directory.
+
+You can override this behavior by specifying an explicit path with `--mapping-path`.
 
 ## Token Server
 
