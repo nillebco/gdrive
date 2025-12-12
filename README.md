@@ -13,8 +13,11 @@ Available in both Python and Node.js implementations.
 # Export a Google Doc to Markdown
 ./cli export 1abc123xyz output.md
 
-# Re-export all previously exported documents (sync with latest)
+# Re-export all previously exported documents (sync with latest from Drive)
 ./cli pull
+
+# Re-upload all previously uploaded files (sync local changes to Drive)
+./cli push
 
 # Use Node.js implementation instead
 ./cli --node upload document.md
@@ -235,6 +238,50 @@ Re-export all documents that have been previously exported. This is useful for s
 3. Writes the content to the same local path as the original export
 4. Updates the `last_operation` timestamp in the mapping
 
+### push
+
+Re-upload all files that have been previously uploaded. This is useful for syncing local changes back to Google Drive.
+
+```bash
+./cli [--node] push [options]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--credentials-fpath` | `-c` | Path to credentials JSON file |
+| `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
+| `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
+| `--overwrite` | | Skip upstream modification check and overwrite without prompting |
+| `--token-server` | | URL of token server to fetch OAuth token from |
+
+**Examples:**
+
+```bash
+# Re-upload all previously uploaded files
+./cli push
+
+# Re-upload using a custom mapping file
+./cli push --mapping-path my-mapping.json
+
+# Re-upload without prompting for upstream changes
+./cli push --overwrite
+
+# Re-upload using Node.js implementation
+./cli --node push
+
+# Re-upload using a token server for authentication
+./cli push --token-server http://your-server:8080
+```
+
+**How it works:**
+
+1. Reads the `uploads` section from `files-mapping.json`
+2. For each uploaded file, uploads the local version to Google Drive
+3. Warns if the upstream file was modified after the last operation (unless `--overwrite` is used)
+4. Updates the `last_operation` timestamp in the mapping
+
 ## Supported Export Formats
 
 | Format | Extension | Document Types |
@@ -276,14 +323,17 @@ The tool maintains a `files-mapping.json` file that tracks both uploads and expo
     "/absolute/path/to/file.md": {
       "local_path": "/absolute/path/to/file.md",
       "drive_file_id": "1abc123xyz",
-      "last_operation": "2025-12-02T10:30:00Z"
+      "last_operation": "2025-12-02T10:30:00Z",
+      "source_mimetype": "text/markdown",
+      "destination_mimetype": "application/vnd.google-apps.document"
     }
   },
   "exports": {
     "1abc123xyz": {
       "local_path": "/absolute/path/to/exported.md",
       "drive_file_id": "1abc123xyz",
-      "last_operation": "2025-12-02T10:35:00Z"
+      "last_operation": "2025-12-02T10:35:00Z",
+      "export_format": "md"
     }
   }
 }
@@ -293,7 +343,8 @@ This allows:
 
 - **Updating existing files** instead of creating duplicates when you upload the same file again
 - **Tracking** which files have been uploaded and exported
-- **Re-exporting all documents** with a single `pull` command
+- **Re-exporting all documents** with a single `pull` command, preserving the original export format
+- **Re-uploading all files** with a single `push` command, preserving the original MIME type conversions
 - **Timestamps** showing when each operation was last performed
 
 ### Automatic Discovery

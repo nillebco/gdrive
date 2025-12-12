@@ -27,6 +27,8 @@ const MIME_TYPES = {
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   md: 'text/markdown',
   mdgdoc: 'application/vnd.google-apps.document',
+  csv: 'text/csv',
+  tsv: 'text/tab-separated-values',
 };
 
 // Export MIME types for Google Workspace documents
@@ -103,14 +105,27 @@ async function getUpstreamModifiedTime(drive, fileId) {
  * @param {string} localPath - Local file path
  * @param {string} driveFileId - Google Drive file ID
  * @param {Date} lastOperation - Timestamp of last operation
+ * @param {string|null} sourceMimetype - MIME type of source file
+ * @param {string|null} destinationMimetype - MIME type for destination file in Drive
+ * @param {string|null} exportFormat - Export format (e.g., 'md', 'docx') for exports
  * @returns {object} FileRecord object
  */
-function createFileRecord(localPath, driveFileId, lastOperation = new Date()) {
-  return {
+function createFileRecord(localPath, driveFileId, lastOperation = new Date(), sourceMimetype = null, destinationMimetype = null, exportFormat = null) {
+  const record = {
     local_path: localPath,
     drive_file_id: driveFileId,
     last_operation: lastOperation.toISOString(),
   };
+  if (sourceMimetype) {
+    record.source_mimetype = sourceMimetype;
+  }
+  if (destinationMimetype) {
+    record.destination_mimetype = destinationMimetype;
+  }
+  if (exportFormat) {
+    record.export_format = exportFormat;
+  }
+  return record;
 }
 
 /**
@@ -509,8 +524,10 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
         fields: 'id',
       });
       result = response.data;
-      // Update timestamp
+      // Update timestamp and mimetypes
       existingRecord.last_operation = new Date().toISOString();
+      existingRecord.source_mimetype = mimeType;
+      existingRecord.destination_mimetype = destinationMimetype || null;
       saveMapping(mapping, mappingPath);
     } catch {
       // If update fails (e.g., file was deleted), create a new one
@@ -522,7 +539,7 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
         fields: 'id',
       });
       result = response.data;
-      mapping.uploads[absPath] = createFileRecord(absPath, result.id);
+      mapping.uploads[absPath] = createFileRecord(absPath, result.id, new Date(), mimeType, destinationMimetype);
       saveMapping(mapping, mappingPath);
     }
   } else {
@@ -533,7 +550,7 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
       fields: 'id',
     });
     result = response.data;
-    mapping.uploads[absPath] = createFileRecord(absPath, result.id);
+    mapping.uploads[absPath] = createFileRecord(absPath, result.id, new Date(), mimeType, destinationMimetype);
     saveMapping(mapping, mappingPath);
   }
 
@@ -583,7 +600,7 @@ async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFp
   // Record the export in the mapping
   const absOutputPath = getAbsolutePath(outputPath);
   const mapping = loadMapping(mappingPath);
-  mapping.exports[fileId] = createFileRecord(absOutputPath, fileId);
+  mapping.exports[fileId] = createFileRecord(absOutputPath, fileId, new Date(), null, null, exportFormat);
   saveMapping(mapping, mappingPath);
 
   return outputPath;
@@ -611,9 +628,12 @@ async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = 
   for (const [fileId, record] of Object.entries(mapping.exports)) {
     const outputPath = record.local_path;
     
-    // Determine export format from the file extension
-    const ext = path.extname(outputPath).slice(1).toLowerCase();
-    const exportFormat = EXPORT_MIME_TYPES[ext] ? ext : 'md';
+    // Use stored export format if available, otherwise determine from file extension
+    let exportFormat = record.export_format;
+    if (!exportFormat) {
+      const ext = path.extname(outputPath).slice(1).toLowerCase();
+      exportFormat = EXPORT_MIME_TYPES[ext] ? ext : 'md';
+    }
     
     const mimeType = EXPORT_MIME_TYPES[exportFormat];
     if (!mimeType) {
@@ -644,6 +664,101 @@ async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = 
       results.push(outputPath);
     } catch (error) {
       console.error(`Warning: Failed to re-export ${outputPath}: ${error.message}`);
+      continue;
+    }
+  }
+  
+  // Save updated mapping
+  saveMapping(mapping, mappingPath);
+  
+  return results;
+}
+
+/**
+ * Re-upload all files that have been previously uploaded.
+ * @param {string|null} credentialsFpath - Path to credentials file
+ * @param {string|null} tokenPath - Path to token file
+ * @param {string|null} mappingPath - Path to files mapping file
+ * @param {boolean} overwrite - Skip upstream modification check
+ * @returns {Promise<string[]>} Array of paths to re-uploaded files
+ */
+async function pushAll(credentialsFpath = null, tokenPath = null, mappingPath = null, overwrite = false) {
+  const mapping = loadMapping(mappingPath);
+  
+  if (!mapping.uploads || Object.keys(mapping.uploads).length === 0) {
+    return [];
+  }
+  
+  const auth = await getCredentials(credentialsFpath, tokenPath);
+  const drive = google.drive({ version: 'v3', auth });
+  
+  const results = [];
+  
+  for (const [localPath, record] of Object.entries(mapping.uploads)) {
+    // Check if local file exists
+    if (!fs.existsSync(localPath)) {
+      console.error(`Warning: Skipping ${localPath} - file not found`);
+      continue;
+    }
+    
+    // Use stored MIME type if available, otherwise determine from extension
+    let sourceMimetype = record.source_mimetype;
+    if (!sourceMimetype) {
+      const ext = path.extname(localPath).slice(1).toLowerCase();
+      sourceMimetype = MIME_TYPES[ext];
+    }
+    if (!sourceMimetype) {
+      const ext = path.extname(localPath).slice(1).toLowerCase();
+      console.error(`Warning: Skipping ${localPath} - unsupported format: ${ext}`);
+      continue;
+    }
+    
+    // Use stored destination MIME type if available
+    const destinationMimetype = record.destination_mimetype;
+    
+    try {
+      // Check for upstream modifications before updating
+      if (!overwrite) {
+        const upstreamModifiedTime = await getUpstreamModifiedTime(drive, record.drive_file_id);
+        if (upstreamModifiedTime) {
+          const lastOperation = new Date(record.last_operation);
+          if (upstreamModifiedTime > lastOperation) {
+            console.error(`Warning: ${localPath} - upstream was modified after last operation.`);
+            console.error(`  Last local operation: ${lastOperation.toISOString()}`);
+            console.error(`  Upstream modified:    ${upstreamModifiedTime.toISOString()}`);
+            const proceed = await promptConfirmation('Do you want to overwrite the upstream changes?');
+            if (!proceed) {
+              console.log(`Skipping: ${localPath}`);
+              continue;
+            }
+          }
+        }
+      }
+      
+      // Prepare metadata and media
+      const fileMetadata = { name: path.basename(localPath) };
+      if (destinationMimetype) {
+        fileMetadata.mimeType = destinationMimetype;
+      }
+      const media = {
+        mimeType: sourceMimetype,
+        body: fs.createReadStream(localPath),
+      };
+      
+      // Update existing file
+      await drive.files.update({
+        fileId: record.drive_file_id,
+        requestBody: fileMetadata,
+        media,
+        fields: 'id',
+      });
+      
+      // Update timestamp
+      record.last_operation = new Date().toISOString();
+      results.push(localPath);
+      
+    } catch (error) {
+      console.error(`Warning: Failed to re-upload ${localPath}: ${error.message}`);
       continue;
     }
   }
@@ -853,6 +968,41 @@ program
           console.log(`Re-exported: ${filePath}`);
         }
         console.log(`\nTotal: ${results.length} document(s) re-exported.`);
+      }
+    } catch (error) {
+      console.error('Error:', error.message);
+      process.exit(1);
+    }
+  });
+
+// Push command
+program
+  .command('push')
+  .description('Re-upload all files that have been previously uploaded')
+  .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
+  .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
+  .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
+  .option('--overwrite', 'Skip upstream modification check and overwrite without prompting')
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .action(async (options) => {
+    try {
+      // If token-server is provided, fetch token from server first
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      }
+      const results = await pushAll(
+        options.credentialsFpath,
+        options.tokenPath,
+        options.mappingPath,
+        options.overwrite || false
+      );
+      if (results.length === 0) {
+        console.log('No previously uploaded files found.');
+      } else {
+        for (const filePath of results) {
+          console.log(`Re-uploaded: ${filePath}`);
+        }
+        console.log(`\nTotal: ${results.length} file(s) re-uploaded.`);
       }
     } catch (error) {
       console.error('Error:', error.message);
@@ -1587,6 +1737,7 @@ export {
   exportFile,
   shareFile,
   pullAll,
+  pushAll,
   getCredentials,
   loadToken,
   saveToken,

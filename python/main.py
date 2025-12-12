@@ -38,6 +38,9 @@ class FileRecord(BaseModel):
     local_path: str
     drive_file_id: str
     last_operation: datetime
+    source_mimetype: Optional[str] = None
+    destination_mimetype: Optional[str] = None
+    export_format: Optional[str] = None  # For exports: the format used (e.g., 'md', 'docx')
 
 
 class FilesMapping(BaseModel):
@@ -221,6 +224,8 @@ MIME_TYPES = {
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "md": "text/markdown",
     "mdgdoc": "application/vnd.google-apps.document",
+    "csv": "text/csv",
+    "tsv": "text/tab-separated-values",
 }
 
 
@@ -327,8 +332,10 @@ def upload_file(
                 media_body=media,
                 fields="id"
             ).execute()
-            # Update timestamp
+            # Update timestamp and mimetypes
             existing_record.last_operation = datetime.now(timezone.utc)
+            existing_record.source_mimetype = source_mimetype
+            existing_record.destination_mimetype = destination_mimetype
             _save_mapping(mapping, mapping_path)
         except Exception:
             # If update fails (e.g., file was deleted), create a new one
@@ -337,6 +344,8 @@ def upload_file(
                 local_path=abs_path,
                 drive_file_id=result["id"],
                 last_operation=datetime.now(timezone.utc),
+                source_mimetype=source_mimetype,
+                destination_mimetype=destination_mimetype,
             )
             _save_mapping(mapping, mapping_path)
     else:
@@ -346,6 +355,8 @@ def upload_file(
             local_path=abs_path,
             drive_file_id=result["id"],
             last_operation=datetime.now(timezone.utc),
+            source_mimetype=source_mimetype,
+            destination_mimetype=destination_mimetype,
         )
         _save_mapping(mapping, mapping_path)
     
@@ -400,6 +411,7 @@ def export_file(
         local_path=abs_output_path,
         drive_file_id=file_id,
         last_operation=datetime.now(timezone.utc),
+        export_format=export_format,
     )
     _save_mapping(mapping, mapping_path)
     
@@ -431,10 +443,13 @@ def pull_all(
     
     results = []
     for file_id, record in mapping.exports.items():
-        # Determine export format from the file extension
         output_path = record.local_path
-        ext = os.path.splitext(output_path)[1].lstrip('.').lower()
-        export_format = ext if ext in EXPORT_MIME_TYPES else "md"
+        
+        # Use stored export format if available, otherwise determine from file extension
+        export_format = record.export_format
+        if export_format is None:
+            ext = os.path.splitext(output_path)[1].lstrip('.').lower()
+            export_format = ext if ext in EXPORT_MIME_TYPES else "md"
         
         # Get the MIME type for the export format
         mime_type = EXPORT_MIME_TYPES.get(export_format)
@@ -468,6 +483,98 @@ def pull_all(
             results.append(output_path)
         except Exception as e:
             print(f"Warning: Failed to re-export {output_path}: {e}")
+            continue
+    
+    # Save updated mapping
+    _save_mapping(mapping, mapping_path)
+    
+    return results
+
+
+def push_all(
+    credentials_fpath: Optional[str] = None,
+    token_path: Optional[str] = None,
+    mapping_path: Optional[str] = None,
+    overwrite: bool = False,
+) -> list[str]:
+    """Re-upload all files that have been previously uploaded.
+    
+    Args:
+        credentials_fpath: Path to credentials file
+        token_path: Path to token file
+        mapping_path: Path to files mapping file
+        overwrite: Skip upstream modification check and overwrite without prompting
+    
+    Returns:
+        List of paths to the re-uploaded files
+    """
+    mapping = _load_mapping(mapping_path)
+    
+    if not mapping.uploads:
+        return []
+    
+    creds = get_credentials(credentials_fpath, token_path)
+    drive = build("drive", "v3", credentials=creds)
+    
+    results = []
+    for local_path, record in mapping.uploads.items():
+        # Check if local file exists
+        if not os.path.exists(local_path):
+            print(f"Warning: Skipping {local_path} - file not found")
+            continue
+        
+        # Use stored MIME type if available, otherwise determine from extension
+        source_mimetype = record.source_mimetype
+        if source_mimetype is None:
+            ext = os.path.splitext(local_path)[1].lstrip('.').lower()
+            source_mimetype = MIME_TYPES.get(ext)
+        if source_mimetype is None:
+            ext = os.path.splitext(local_path)[1].lstrip('.').lower()
+            print(f"Warning: Skipping {local_path} - unsupported format: {ext}")
+            continue
+        
+        # Use stored destination MIME type if available
+        destination_mimetype = record.destination_mimetype
+        
+        try:
+            # Check for upstream modifications before updating
+            if not overwrite:
+                upstream_modified_time = _get_upstream_modified_time(drive, record.drive_file_id)
+                if upstream_modified_time:
+                    last_operation = record.last_operation
+                    # Ensure last_operation is timezone-aware for comparison
+                    if last_operation.tzinfo is None:
+                        last_operation = last_operation.replace(tzinfo=timezone.utc)
+                    if upstream_modified_time > last_operation:
+                        import sys
+                        print(f"Warning: {local_path} - upstream was modified after last operation.", file=sys.stderr)
+                        print(f"  Last local operation: {last_operation.isoformat()}", file=sys.stderr)
+                        print(f"  Upstream modified:    {upstream_modified_time.isoformat()}", file=sys.stderr)
+                        proceed = _prompt_confirmation("Do you want to overwrite the upstream changes?")
+                        if not proceed:
+                            print(f"Skipping: {local_path}")
+                            continue
+            
+            # Prepare metadata and media
+            metadata = {"name": os.path.basename(local_path)}
+            if destination_mimetype:
+                metadata["mimeType"] = destination_mimetype
+            media = MediaFileUpload(local_path, mimetype=source_mimetype)
+            
+            # Update existing file
+            result = drive.files().update(
+                fileId=record.drive_file_id,
+                body=metadata,
+                media_body=media,
+                fields="id"
+            ).execute()
+            
+            # Update timestamp
+            record.last_operation = datetime.now(timezone.utc)
+            results.append(local_path)
+            
+        except Exception as e:
+            print(f"Warning: Failed to re-upload {local_path}: {e}")
             continue
     
     # Save updated mapping
@@ -1475,6 +1582,72 @@ def pull(
             print(f"\nTotal: {len(results)} document(s) re-exported.")
     
     asyncio.run(_pull())
+
+
+@app.command()
+def push(
+    credentials_fpath: Annotated[
+        Optional[str], 
+        typer.Option(
+            "--credentials-fpath", 
+            "-c",
+            help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
+        )
+    ] = None,
+    token_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-path",
+            "-t",
+            help=f"Path to save/load OAuth token. Can also be set via {TOKEN_ENV_VAR} env var. Default: {DEFAULT_TOKEN_PATH}"
+        )
+    ] = None,
+    mapping_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--mapping-path",
+            "-m",
+            help=f"Path to files mapping JSON. Default: {DEFAULT_MAPPING_PATH}"
+        )
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Skip upstream modification check and overwrite without prompting"
+        )
+    ] = False,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
+):
+    """Re-upload all files that have been previously uploaded.
+    
+    This command reads the files mapping and re-uploads all files
+    that were previously uploaded, updating them with the latest local content.
+    
+    Examples:
+        python main.py push
+        python main.py push --mapping-path custom-mapping.json
+        python main.py push --overwrite
+    """
+    async def _push():
+        # If token-server is provided, fetch token from server first
+        if token_server:
+            _fetch_token_from_server(token_server, token_path)
+        results = await asyncify(push_all)(credentials_fpath, token_path, mapping_path, overwrite)
+        if not results:
+            print("No previously uploaded files found.")
+        else:
+            for path in results:
+                print(f"Re-uploaded: {path}")
+            print(f"\nTotal: {len(results)} file(s) re-uploaded.")
+    
+    asyncio.run(_push())
 
 
 @app.command()
