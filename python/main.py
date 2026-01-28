@@ -223,10 +223,29 @@ MIME_TYPES = {
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     "md": "text/markdown",
-    "mdgdoc": "application/vnd.google-apps.document",
+    "txt": "text/plain",
+    "html": "text/html",
     "csv": "text/csv",
     "tsv": "text/tab-separated-values",
+    "json": "application/json",
+    "xml": "application/xml",
+    # Google Workspace types (for destination)
+    "gdoc": "application/vnd.google-apps.document",
+    "gsheet": "application/vnd.google-apps.spreadsheet",
+    "gslide": "application/vnd.google-apps.presentation",
+    "gdraw": "application/vnd.google-apps.drawing",
 }
+
+
+def _resolve_mimetype(value: Optional[str]) -> Optional[str]:
+    """Resolve a MIME type from a short alias or return as-is if it's a full MIME type."""
+    if value is None:
+        return None
+    # If it looks like a full MIME type (contains /), return as-is
+    if "/" in value:
+        return value
+    # Otherwise, look up in the mapping
+    return MIME_TYPES.get(value.lower(), value)
 
 
 def _get_upstream_modified_time(drive, file_id: str) -> Optional[datetime]:
@@ -1326,14 +1345,105 @@ def start_token_server(port: int, credentials_fpath: Optional[str] = None):
 app = typer.Typer(help="Google Drive file operations")
 
 @app.command()
+def login(
+    credentials_fpath: Annotated[
+        Optional[str],
+        typer.Option(
+            "--credentials-fpath",
+            "-c",
+            help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
+        )
+    ] = None,
+    token_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-path",
+            "-t",
+            help=f"Path to save/load OAuth token. Can also be set via {TOKEN_ENV_VAR} env var. Default: {DEFAULT_TOKEN_PATH}"
+        )
+    ] = None,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            "-f",
+            help="Force re-authentication even if a valid token exists"
+        )
+    ] = False,
+):
+    """Authenticate with Google and save the OAuth token.
+
+    This command initiates the OAuth flow to authenticate with your Google account
+    and saves the token for future use. If a valid token already exists, it will
+    be reused unless --force is specified.
+
+    Examples:
+        python main.py login
+        python main.py login --force
+        python main.py login --token-server http://your-server:8080
+    """
+    # If token-server is provided, fetch token from server
+    if token_server:
+        _fetch_token_from_server(token_server, token_path)
+        return
+
+    # Check for existing valid token
+    if not force:
+        existing_token = _load_token(token_path)
+        if existing_token and existing_token.valid:
+            print("Already authenticated. Use --force to re-authenticate.")
+            return
+
+        # Try to refresh expired token
+        if existing_token and existing_token.expired and existing_token.refresh_token:
+            try:
+                existing_token.refresh(Request())
+                _save_token(existing_token, token_path)
+                print("Token refreshed successfully.")
+                return
+            except Exception:
+                pass  # Fall through to new OAuth flow
+
+    # Run OAuth flow
+    try:
+        get_credentials(credentials_fpath, token_path)
+        path = token_path or DEFAULT_TOKEN_PATH
+        print(f"Authentication successful. Token saved to {path}")
+    except Exception as e:
+        print(f"Authentication failed: {e}")
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def upload(
     fpath: Annotated[str, typer.Argument(help="Path to the file to upload")],
-    source_mimetype: Annotated[Optional[str], typer.Option(help="MIME type of the source file")] = None,
-    destination_mimetype: Annotated[Optional[str], typer.Option(help="MIME type for the destination file in Drive")] = None,
-    credentials_fpath: Annotated[
-        Optional[str], 
+    source_mimetype: Annotated[
+        Optional[str],
         typer.Option(
-            "--credentials-fpath", 
+            "--source-mimetype",
+            "-s",
+            help="MIME type of the source file. Accepts short aliases: md, txt, pdf, docx, xlsx, csv, etc."
+        )
+    ] = None,
+    destination_mimetype: Annotated[
+        Optional[str],
+        typer.Option(
+            "--destination-mimetype",
+            "-d",
+            help="MIME type for the destination file in Drive. Accepts short aliases: gdoc, gsheet, gslide, gdraw"
+        )
+    ] = None,
+    credentials_fpath: Annotated[
+        Optional[str],
+        typer.Option(
+            "--credentials-fpath",
             "-c",
             help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
         )
@@ -1374,9 +1484,12 @@ def upload(
         # If token-server is provided, fetch token from server first
         if token_server:
             _fetch_token_from_server(token_server, token_path)
-        file = await asyncify(upload_file)(fpath, source_mimetype, destination_mimetype, credentials_fpath, token_path, mapping_path, overwrite)
+        # Resolve short aliases to full MIME types
+        resolved_source = _resolve_mimetype(source_mimetype)
+        resolved_dest = _resolve_mimetype(destination_mimetype)
+        file = await asyncify(upload_file)(fpath, resolved_source, resolved_dest, credentials_fpath, token_path, mapping_path, overwrite)
         print(file["id"])
-    
+
     asyncio.run(_upload())
 
 

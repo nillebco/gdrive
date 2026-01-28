@@ -7,11 +7,17 @@ Available in both Python and Node.js implementations.
 ## Quick Start
 
 ```bash
+# Login to Google (first time setup)
+./cli login
+
 # Upload a file (Python, default)
 ./cli upload document.md
 
 # Export a Google Doc to Markdown
 ./cli export 1abc123xyz output.md
+
+# Share an uploaded file with someone
+./cli share document.md user@example.com
 
 # Re-export all previously exported documents (sync with latest from Drive)
 ./cli pull
@@ -20,6 +26,7 @@ Available in both Python and Node.js implementations.
 ./cli push
 
 # Use Node.js implementation instead
+./cli --node login
 ./cli --node upload document.md
 ./cli --node export 1abc123xyz output.md
 ./cli --node pull
@@ -74,9 +81,98 @@ On first run, a browser window will open for authentication. The token is saved 
    - Or save it as `service_account.json` in the working directory
    - Or pass the file path with `--credentials-fpath`
 
+## Logging In to a New Google Account
+
+If you're setting up gdrive for the first time or need to authenticate with a different Google account:
+
+### Quick Login (OAuth)
+
+1. **Get OAuth credentials** from [Google Cloud Console](https://console.cloud.google.com/apis/credentials):
+   - Create a new project (or select existing)
+   - Enable the Google Drive API
+   - Create OAuth 2.0 Client ID (Desktop application type)
+   - Download the credentials JSON file
+
+2. **Run the login command**:
+
+   ```bash
+   # Set credentials via environment variable
+   export GOOGLE_CREDENTIALS=$(cat path/to/credentials.json)
+   ./cli login
+
+   # Or pass credentials file directly
+   ./cli login --credentials-fpath path/to/credentials.json
+   ```
+
+3. **Authorize in browser**: A browser window opens automatically. Sign in with your Google account and grant access to Google Drive.
+
+4. **Token saved**: The OAuth token is saved to `token.json` for future use. Subsequent commands won't require browser authentication.
+
+### Switching Accounts
+
+To login with a different Google account:
+
+```bash
+# Force re-authentication with a new account
+./cli login --force
+```
+
+Or manually remove the existing token:
+
+```bash
+rm token.json
+./cli login
+```
+
+### Using a Token Server
+
+If your organization runs a token server, you don't need your own Google Cloud credentials:
+
+```bash
+./cli login --token-server http://your-server:8080
+```
+
+This opens a browser for Google authentication via the shared server.
+
 ## Commands
 
 > **Tip:** Add `--node` before any command to use the Node.js implementation instead of Python.
+
+### login
+
+Authenticate with Google and save the OAuth token for future use.
+
+```bash
+./cli [--node] login [options]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--credentials-fpath` | `-c` | Path to credentials JSON file |
+| `--token-path` | `-t` | Path to save OAuth token (default: `token.json`) |
+| `--token-server` | | URL of token server to fetch OAuth token from |
+| `--force` | `-f` | Force re-authentication even if a valid token exists |
+
+**Examples:**
+
+```bash
+# Login with default settings (opens browser)
+./cli login
+
+# Login with specific credentials file
+./cli login -c my-credentials.json
+
+# Force re-authentication (switch accounts)
+./cli login --force
+
+# Login via token server
+./cli login --token-server http://your-server:8080
+
+# Save token to custom path
+./cli login --token-path ~/.config/gdrive/token.json
+```
 
 ### server
 
@@ -135,13 +231,33 @@ Upload a file to Google Drive. If the same file was previously uploaded, it will
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--source-mimetype` | | MIME type of the source file (auto-detected from extension) |
-| `--destination-mimetype` | | MIME type for the destination file in Drive |
+| `--source-mimetype` | `-s` | MIME type of the source file (auto-detected from extension) |
+| `--destination-mimetype` | `-d` | MIME type for the destination file in Drive |
 | `--credentials-fpath` | `-c` | Path to credentials JSON file |
 | `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
 | `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
 | `--token-server` | | URL of token server to fetch OAuth token from |
 | `--overwrite` | | Skip upstream modification check and overwrite without prompting |
+
+**MIME Type Aliases:**
+
+Instead of full MIME types, you can use short aliases:
+
+| Alias | MIME Type |
+|-------|-----------|
+| `md` | `text/markdown` |
+| `txt` | `text/plain` |
+| `html` | `text/html` |
+| `pdf` | `application/pdf` |
+| `docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
+| `xlsx` | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` |
+| `pptx` | `application/vnd.openxmlformats-officedocument.presentationml.presentation` |
+| `csv` | `text/csv` |
+| `json` | `application/json` |
+| `gdoc` | `application/vnd.google-apps.document` |
+| `gsheet` | `application/vnd.google-apps.spreadsheet` |
+| `gslide` | `application/vnd.google-apps.presentation` |
+| `gdraw` | `application/vnd.google-apps.drawing` |
 
 **Examples:**
 
@@ -149,10 +265,16 @@ Upload a file to Google Drive. If the same file was previously uploaded, it will
 # Upload a markdown file as-is
 ./cli upload document.md
 
-# Upload a markdown file and convert it to Google Docs
+# Upload a markdown file and convert it to Google Docs (short form)
+./cli upload document.md -s md -d gdoc
+
+# Upload a markdown file and convert it to Google Docs (long form)
 ./cli upload document.md \
   --source-mimetype text/markdown \
   --destination-mimetype "application/vnd.google-apps.document"
+
+# Upload a CSV and convert to Google Sheets
+./cli upload data.csv -d gsheet
 
 # Upload a PDF
 ./cli upload report.pdf
@@ -281,6 +403,56 @@ Re-upload all files that have been previously uploaded. This is useful for synci
 2. For each uploaded file, uploads the local version to Google Drive
 3. Warns if the upstream file was modified after the last operation (unless `--overwrite` is used)
 4. Updates the `last_operation` timestamp in the mapping
+
+### share
+
+Share an uploaded file with one or more email addresses.
+
+```bash
+./cli [--node] share <file_path> <emails> [options]
+```
+
+**Arguments:**
+
+| Argument | Description |
+|----------|-------------|
+| `file_path` | Path to the local file (must have been previously uploaded) |
+| `emails` | Email address(es) to share with (comma-separated for multiple) |
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--role` | `-r` | Permission role: `reader`, `writer`, or `commenter` (default: `reader`) |
+| `--notify/--no-notify` | | Send notification email to recipients (default: `--notify`) |
+| `--credentials-fpath` | `-c` | Path to credentials JSON file |
+| `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
+| `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
+| `--token-server` | | URL of token server to fetch OAuth token from |
+
+**Examples:**
+
+```bash
+# Share with a single user as viewer (default)
+./cli share document.md user@example.com
+
+# Share with multiple users
+./cli share document.md "user1@example.com,user2@example.com"
+
+# Share with write access
+./cli share document.md user@example.com --role writer
+
+# Share with comment access
+./cli share document.md user@example.com --role commenter
+
+# Share without sending notification email
+./cli share document.md user@example.com --no-notify
+
+# Share using Node.js implementation
+./cli --node share document.md user@example.com
+```
+
+**Note:** The file must have been previously uploaded using the `upload` command. The command uses the local file path to look up the corresponding Google Drive file ID from the mapping.
 
 ## Supported Export Formats
 

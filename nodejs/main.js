@@ -26,10 +26,31 @@ const MIME_TYPES = {
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   md: 'text/markdown',
-  mdgdoc: 'application/vnd.google-apps.document',
+  txt: 'text/plain',
+  html: 'text/html',
   csv: 'text/csv',
   tsv: 'text/tab-separated-values',
+  json: 'application/json',
+  xml: 'application/xml',
+  // Google Workspace types (for destination)
+  gdoc: 'application/vnd.google-apps.document',
+  gsheet: 'application/vnd.google-apps.spreadsheet',
+  gslide: 'application/vnd.google-apps.presentation',
+  gdraw: 'application/vnd.google-apps.drawing',
 };
+
+/**
+ * Resolve a MIME type from a short alias or return as-is if it's a full MIME type.
+ * @param {string|null} value - Short alias or full MIME type
+ * @returns {string|null} Resolved MIME type
+ */
+function resolveMimetype(value) {
+  if (!value) return null;
+  // If it looks like a full MIME type (contains /), return as-is
+  if (value.includes('/')) return value;
+  // Otherwise, look up in the mapping
+  return MIME_TYPES[value.toLowerCase()] || value;
+}
 
 // Export MIME types for Google Workspace documents
 const EXPORT_MIME_TYPES = {
@@ -837,8 +858,8 @@ program
   .command('upload')
   .description('Upload a file to Google Drive')
   .argument('<fpath>', 'Path to the file to upload')
-  .option('--source-mimetype <type>', 'MIME type of the source file')
-  .option('--destination-mimetype <type>', 'MIME type for the destination file in Drive')
+  .option('-s, --source-mimetype <type>', 'MIME type of the source file. Accepts short aliases: md, txt, pdf, docx, xlsx, csv, etc.')
+  .option('-d, --destination-mimetype <type>', 'MIME type for the destination file in Drive. Accepts short aliases: gdoc, gsheet, gslide, gdraw')
   .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
@@ -850,10 +871,13 @@ program
       if (options.tokenServer) {
         await fetchTokenFromServer(options.tokenServer, options.tokenPath);
       }
+      // Resolve short aliases to full MIME types
+      const resolvedSource = resolveMimetype(options.sourceMimetype);
+      const resolvedDest = resolveMimetype(options.destinationMimetype);
       const file = await uploadFile(
         fpath,
-        options.sourceMimetype,
-        options.destinationMimetype,
+        resolvedSource,
+        resolvedDest,
         options.credentialsFpath,
         options.tokenPath,
         options.mappingPath,
@@ -1714,6 +1738,74 @@ async function startTokenServer(port, credentialsFpath = null) {
   });
 }
 
+// Login command
+program
+  .command('login')
+  .description('Authenticate with Google and save the OAuth token')
+  .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
+  .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('-f, --force', 'Force re-authentication even if a valid token exists')
+  .action(async (options) => {
+    try {
+      // If token-server is provided, fetch token from server
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+        console.log('Authentication successful via token server.');
+        return;
+      }
+
+      // Check for existing valid token
+      if (!options.force) {
+        const existingToken = loadToken(options.tokenPath);
+        if (existingToken) {
+          // Check if token is expired
+          if (!existingToken.expiry_date || Date.now() < existingToken.expiry_date) {
+            console.log('Already authenticated. Use --force to re-authenticate.');
+            return;
+          }
+
+          // Try to refresh expired token
+          if (existingToken.refresh_token) {
+            try {
+              // Load credentials to get client info
+              const credentialsJson = process.env[CREDENTIALS_ENV_VAR];
+              let credentials;
+              if (credentialsJson) {
+                credentials = JSON.parse(credentialsJson);
+              } else {
+                const credPath = options.credentialsFpath || 'service_account.json';
+                if (fs.existsSync(credPath)) {
+                  credentials = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+                }
+              }
+
+              if (credentials && (credentials.installed || credentials.web)) {
+                const { client_id, client_secret } = credentials.installed || credentials.web;
+                const oauth2Client = new google.auth.OAuth2(client_id, client_secret);
+                oauth2Client.setCredentials(existingToken);
+                const { credentials: newCredentials } = await oauth2Client.refreshAccessToken();
+                saveToken(newCredentials, options.tokenPath);
+                console.log('Token refreshed successfully.');
+                return;
+              }
+            } catch {
+              // Fall through to new OAuth flow
+            }
+          }
+        }
+      }
+
+      // Run OAuth flow
+      await getCredentials(options.credentialsFpath, options.tokenPath);
+      const tokenPath = options.tokenPath || DEFAULT_TOKEN_PATH;
+      console.log(`Authentication successful. Token saved to ${tokenPath}`);
+    } catch (error) {
+      console.error('Authentication failed:', error.message);
+      process.exit(1);
+    }
+  });
+
 // Server command
 program
   .command('server')
@@ -1750,6 +1842,7 @@ export {
   getAbsolutePath,
   promptConfirmation,
   getUpstreamModifiedTime,
+  resolveMimetype,
   startTokenServer,
   fetchTokenFromServer,
   SCOPES,
