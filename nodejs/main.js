@@ -104,6 +104,47 @@ async function promptConfirmation(message) {
 }
 
 /**
+ * Resolve a shared drive name to its ID.
+ * @param {object} drive - Google Drive API client
+ * @param {string} driveName - Name of the shared drive
+ * @returns {Promise<string>} The drive ID
+ * @throws {Error} If drive not found or multiple matches
+ */
+async function resolveDriveId(drive, driveName) {
+  const escapedName = driveName.replace(/'/g, "\\'");
+  const response = await drive.drives.list({
+    q: `name = '${escapedName}'`,
+    fields: 'drives(id, name)',
+    pageSize: 10,
+  });
+
+  const drives = response.data.drives || [];
+
+  if (drives.length === 0) {
+    throw new Error(`Shared drive not found: "${driveName}"`);
+  }
+  if (drives.length > 1) {
+    const names = drives.map(d => `  - ${d.name} (${d.id})`).join('\n');
+    throw new Error(`Multiple shared drives match "${driveName}":\n${names}\nPlease use --drive-id instead.`);
+  }
+
+  return drives[0].id;
+}
+
+/**
+ * Get drive ID from either --drive-id or --drive-name option.
+ * @param {object} drive - Google Drive API client
+ * @param {string|null} driveId - Explicit drive ID
+ * @param {string|null} driveName - Drive name to resolve
+ * @returns {Promise<string|null>} The drive ID or null
+ */
+async function getDriveIdFromOptions(drive, driveId, driveName) {
+  if (driveId) return driveId;
+  if (driveName) return await resolveDriveId(drive, driveName);
+  return null;
+}
+
+/**
  * Get the modification time of a file on Google Drive.
  * @param {object} drive - Google Drive API client
  * @param {string} fileId - The file ID to check
@@ -114,6 +155,7 @@ async function getUpstreamModifiedTime(drive, fileId) {
     const response = await drive.files.get({
       fileId,
       fields: 'modifiedTime',
+      supportsAllDrives: true,
     });
     return new Date(response.data.modifiedTime);
   } catch {
@@ -129,9 +171,10 @@ async function getUpstreamModifiedTime(drive, fileId) {
  * @param {string|null} sourceMimetype - MIME type of source file
  * @param {string|null} destinationMimetype - MIME type for destination file in Drive
  * @param {string|null} exportFormat - Export format (e.g., 'md', 'docx') for exports
+ * @param {string|null} driveId - Shared drive ID (if file is in a shared drive)
  * @returns {object} FileRecord object
  */
-function createFileRecord(localPath, driveFileId, lastOperation = new Date(), sourceMimetype = null, destinationMimetype = null, exportFormat = null) {
+function createFileRecord(localPath, driveFileId, lastOperation = new Date(), sourceMimetype = null, destinationMimetype = null, exportFormat = null, driveId = null) {
   const record = {
     local_path: localPath,
     drive_file_id: driveFileId,
@@ -145,6 +188,9 @@ function createFileRecord(localPath, driveFileId, lastOperation = new Date(), so
   }
   if (exportFormat) {
     record.export_format = exportFormat;
+  }
+  if (driveId) {
+    record.drive_id = driveId;
   }
   return record;
 }
@@ -477,9 +523,11 @@ async function getCredentials(fpath = null, tokenPath = null) {
  * @param {string|null} tokenPath - Path to token file
  * @param {string|null} mappingPath - Path to files mapping file
  * @param {boolean} overwrite - Skip upstream modification check
+ * @param {string|null} folderId - Parent folder ID (can be a shared drive ID or folder within)
+ * @param {string|null} driveId - Shared drive ID (for tracking in mapping)
  * @returns {Promise<object>} Uploaded file metadata
  */
-async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = null, credentialsFpath = null, tokenPath = null, mappingPath = null, overwrite = false) {
+async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = null, credentialsFpath = null, tokenPath = null, mappingPath = null, overwrite = false, folderId = null, driveId = null) {
   const auth = await getCredentials(credentialsFpath, tokenPath);
   const drive = google.drive({ version: 'v3', auth });
 
@@ -504,6 +552,11 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
 
   if (destinationMimetype) {
     fileMetadata.mimeType = destinationMimetype;
+  }
+
+  // Set parent folder if provided (for shared drives or specific folders)
+  if (folderId) {
+    fileMetadata.parents = [folderId];
   }
 
   const media = {
@@ -536,13 +589,18 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
       }
     }
 
-    // Update existing file
+    // Update existing file (don't change parents on update)
+    const updateMetadata = { name: fileMetadata.name };
+    if (fileMetadata.mimeType) {
+      updateMetadata.mimeType = fileMetadata.mimeType;
+    }
     try {
       const response = await drive.files.update({
         fileId: existingRecord.drive_file_id,
-        requestBody: fileMetadata,
+        requestBody: updateMetadata,
         media,
         fields: 'id',
+        supportsAllDrives: true,
       });
       result = response.data;
       // Update timestamp and mimetypes
@@ -558,9 +616,10 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
         requestBody: fileMetadata,
         media,
         fields: 'id',
+        supportsAllDrives: true,
       });
       result = response.data;
-      mapping.uploads[absPath] = createFileRecord(absPath, result.id, new Date(), mimeType, destinationMimetype);
+      mapping.uploads[absPath] = createFileRecord(absPath, result.id, new Date(), mimeType, destinationMimetype, null, driveId);
       saveMapping(mapping, mappingPath);
     }
   } else {
@@ -569,9 +628,10 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
       requestBody: fileMetadata,
       media,
       fields: 'id',
+      supportsAllDrives: true,
     });
     result = response.data;
-    mapping.uploads[absPath] = createFileRecord(absPath, result.id, new Date(), mimeType, destinationMimetype);
+    mapping.uploads[absPath] = createFileRecord(absPath, result.id, new Date(), mimeType, destinationMimetype, null, driveId);
     saveMapping(mapping, mappingPath);
   }
 
@@ -586,9 +646,10 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
  * @param {string|null} credentialsFpath - Path to credentials file
  * @param {string|null} tokenPath - Path to token file
  * @param {string|null} mappingPath - Path to files mapping file
+ * @param {string|null} driveId - Shared drive ID (for tracking in mapping)
  * @returns {Promise<string>} Output path
  */
-async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFpath = null, tokenPath = null, mappingPath = null) {
+async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFpath = null, tokenPath = null, mappingPath = null, driveId = null) {
   const auth = await getCredentials(credentialsFpath, tokenPath);
   const drive = google.drive({ version: 'v3', auth });
 
@@ -621,7 +682,7 @@ async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFp
   // Record the export in the mapping
   const absOutputPath = getAbsolutePath(outputPath);
   const mapping = loadMapping(mappingPath);
-  mapping.exports[fileId] = createFileRecord(absOutputPath, fileId, new Date(), null, null, exportFormat);
+  mapping.exports[fileId] = createFileRecord(absOutputPath, fileId, new Date(), null, null, exportFormat, driveId);
   saveMapping(mapping, mappingPath);
 
   return outputPath;
@@ -772,6 +833,7 @@ async function pushAll(credentialsFpath = null, tokenPath = null, mappingPath = 
         requestBody: fileMetadata,
         media,
         fields: 'id',
+        supportsAllDrives: true,
       });
       
       // Update timestamp
@@ -837,6 +899,7 @@ async function shareFile(fpath, emails, role = 'reader', notify = true, credenti
       requestBody: permission,
       sendNotificationEmail: notify,
       fields: 'id,type,role,emailAddress',
+      supportsAllDrives: true,
     });
     
     results.push(response.data);
@@ -856,7 +919,7 @@ program
 // Upload command
 program
   .command('upload')
-  .description('Upload a file to Google Drive')
+  .description('Upload a file to Google Drive (supports shared drives)')
   .argument('<fpath>', 'Path to the file to upload')
   .option('-s, --source-mimetype <type>', 'MIME type of the source file. Accepts short aliases: md, txt, pdf, docx, xlsx, csv, etc.')
   .option('-d, --destination-mimetype <type>', 'MIME type for the destination file in Drive. Accepts short aliases: gdoc, gsheet, gslide, gdraw')
@@ -865,12 +928,27 @@ program
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
   .option('--overwrite', 'Skip upstream modification check and overwrite without prompting')
   .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--folder-id <id>', 'Parent folder ID to upload into (can be a shared drive root or folder within)')
+  .option('--drive-id <id>', 'Shared drive ID (for tracking; use --folder-id for the actual destination)')
+  .option('--drive-name <name>', 'Shared drive name (resolved to ID; use --folder-id for the actual destination)')
   .action(async (fpath, options) => {
     try {
       // If token-server is provided, fetch token from server first
       if (options.tokenServer) {
         await fetchTokenFromServer(options.tokenServer, options.tokenPath);
       }
+
+      // Resolve drive name to ID if provided
+      let driveId = options.driveId;
+      if (options.driveName && !driveId) {
+        const auth = await getCredentials(options.credentialsFpath, options.tokenPath);
+        const drive = google.drive({ version: 'v3', auth });
+        driveId = await resolveDriveId(drive, options.driveName);
+      }
+
+      // If drive ID is provided but no folder ID, use drive ID as folder (upload to root of shared drive)
+      const folderId = options.folderId || driveId;
+
       // Resolve short aliases to full MIME types
       const resolvedSource = resolveMimetype(options.sourceMimetype);
       const resolvedDest = resolveMimetype(options.destinationMimetype);
@@ -881,7 +959,9 @@ program
         options.credentialsFpath,
         options.tokenPath,
         options.mappingPath,
-        options.overwrite || false
+        options.overwrite || false,
+        folderId,
+        driveId
       );
       console.log(file.id);
     } catch (error) {
@@ -893,7 +973,7 @@ program
 // Export command
 program
   .command('export')
-  .description('Export a Google Workspace document to a local file')
+  .description('Export a Google Workspace document to a local file (supports shared drives)')
   .argument('<file-id>', 'The Google Drive file ID to export')
   .argument('<output-path>', 'Path where the exported file will be saved')
   .option('-f, --format <format>', `Export format. Supported: ${Object.keys(EXPORT_MIME_TYPES).join(', ')}`, 'md')
@@ -901,19 +981,31 @@ program
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
   .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--drive-id <id>', 'Shared drive ID (for tracking in the mapping file)')
+  .option('--drive-name <name>', 'Shared drive name (resolved to ID for tracking)')
   .action(async (fileId, outputPath, options) => {
     try {
       // If token-server is provided, fetch token from server first
       if (options.tokenServer) {
         await fetchTokenFromServer(options.tokenServer, options.tokenPath);
       }
+
+      // Resolve drive name to ID if provided
+      let driveId = options.driveId;
+      if (options.driveName && !driveId) {
+        const auth = await getCredentials(options.credentialsFpath, options.tokenPath);
+        const drive = google.drive({ version: 'v3', auth });
+        driveId = await resolveDriveId(drive, options.driveName);
+      }
+
       const result = await exportFile(
         fileId,
         outputPath,
         options.format,
         options.credentialsFpath,
         options.tokenPath,
-        options.mappingPath
+        options.mappingPath,
+        driveId
       );
       console.log(`Exported to: ${result}`);
     } catch (error) {
@@ -1087,6 +1179,60 @@ program
       console.log('--- Sync Summary ---');
       console.log(`Documents pulled: ${pullResults.length}`);
       console.log(`Files pushed: ${pushResults.length}`);
+    } catch (error) {
+      console.error('Error:', error.message);
+      process.exit(1);
+    }
+  });
+
+// List shared drives command
+program
+  .command('list-drives')
+  .description('List all shared drives accessible to the user')
+  .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
+  .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('-q, --query <query>', 'Search query (e.g., "name contains \'project\'")')
+  .action(async (options) => {
+    try {
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      }
+      const auth = await getCredentials(options.credentialsFpath, options.tokenPath);
+      const drive = google.drive({ version: 'v3', auth });
+
+      const params = {
+        pageSize: 100,
+        fields: 'nextPageToken, drives(id, name, createdTime)',
+      };
+      if (options.query) {
+        params.q = options.query;
+      }
+
+      let allDrives = [];
+      let pageToken = null;
+
+      do {
+        if (pageToken) params.pageToken = pageToken;
+        const response = await drive.drives.list(params);
+        allDrives = allDrives.concat(response.data.drives || []);
+        pageToken = response.data.nextPageToken;
+      } while (pageToken);
+
+      if (allDrives.length === 0) {
+        console.log('No shared drives found.');
+      } else {
+        console.log('Shared Drives:\n');
+        for (const d of allDrives) {
+          console.log(`  ${d.name}`);
+          console.log(`    ID: ${d.id}`);
+          if (d.createdTime) {
+            console.log(`    Created: ${d.createdTime}`);
+          }
+          console.log('');
+        }
+        console.log(`Total: ${allDrives.length} shared drive(s)`);
+      }
     } catch (error) {
       console.error('Error:', error.message);
       process.exit(1);

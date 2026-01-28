@@ -25,6 +25,15 @@ Available in both Python and Node.js implementations.
 # Re-upload all previously uploaded files (sync local changes to Drive)
 ./cli push
 
+# Sync: pull then push in one command
+./cli sync
+
+# List all shared drives you have access to
+./cli list-drives
+
+# Upload to a shared drive
+./cli upload document.md --drive-name "My Shared Drive"
+
 # Use Node.js implementation instead
 ./cli --node login
 ./cli --node upload document.md
@@ -221,7 +230,7 @@ Start an OAuth token server that allows users without their own Google Cloud cre
 
 ### upload
 
-Upload a file to Google Drive. If the same file was previously uploaded, it will be updated instead of creating a duplicate.
+Upload a file to Google Drive. If the same file was previously uploaded, it will be updated instead of creating a duplicate. Supports shared drives.
 
 ```bash
 ./cli [--node] upload <file_path> [options]
@@ -238,6 +247,9 @@ Upload a file to Google Drive. If the same file was previously uploaded, it will
 | `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
 | `--token-server` | | URL of token server to fetch OAuth token from |
 | `--overwrite` | | Skip upstream modification check and overwrite without prompting |
+| `--folder-id` | | Parent folder ID to upload into (shared drive root or folder within) |
+| `--drive-id` | | Shared drive ID (for tracking in mapping file) |
+| `--drive-name` | | Shared drive name (resolved to ID automatically) |
 
 **MIME Type Aliases:**
 
@@ -281,11 +293,17 @@ Instead of full MIME types, you can use short aliases:
 
 # Upload using a token server for authentication
 ./cli upload document.md --token-server http://your-server:8080
+
+# Upload to a shared drive (by name)
+./cli upload document.md --drive-name "Engineering"
+
+# Upload to a specific folder in a shared drive
+./cli upload document.md --folder-id FOLDER_ID --drive-id DRIVE_ID
 ```
 
 ### export
 
-Export a Google Workspace document (Docs, Sheets, Slides, Drawings) to a local file.
+Export a Google Workspace document (Docs, Sheets, Slides, Drawings) to a local file. Supports shared drives.
 
 ```bash
 ./cli [--node] export <file_id> <output_path> [options]
@@ -300,6 +318,8 @@ Export a Google Workspace document (Docs, Sheets, Slides, Drawings) to a local f
 | `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
 | `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
 | `--token-server` | | URL of token server to fetch OAuth token from |
+| `--drive-id` | | Shared drive ID (for tracking in mapping file) |
+| `--drive-name` | | Shared drive name (resolved to ID for tracking) |
 
 **Examples:**
 
@@ -318,6 +338,9 @@ Export a Google Workspace document (Docs, Sheets, Slides, Drawings) to a local f
 
 # Export using a token server for authentication
 ./cli export 1abc123xyz output.md --token-server http://your-server:8080
+
+# Export from a shared drive (track drive ID in mapping)
+./cli export 1abc123xyz output.md --drive-name "Engineering"
 ```
 
 ### pull
@@ -403,6 +426,76 @@ Re-upload all files that have been previously uploaded. This is useful for synci
 2. For each uploaded file, uploads the local version to Google Drive
 3. Warns if the upstream file was modified after the last operation (unless `--overwrite` is used)
 4. Updates the `last_operation` timestamp in the mapping
+
+### sync
+
+Sync all documents: first pull (re-export), then push (re-upload). Combines both operations in a single command.
+
+```bash
+./cli [--node] sync [options]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--credentials-fpath` | `-c` | Path to credentials JSON file |
+| `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
+| `--mapping-path` | `-m` | Path to files mapping JSON (default: `files-mapping.json`) |
+| `--overwrite` | | Skip upstream modification check and overwrite without prompting |
+| `--token-server` | | URL of token server to fetch OAuth token from |
+
+**Examples:**
+
+```bash
+# Sync all files (pull then push)
+./cli sync
+
+# Sync with overwrite (no prompts for conflicts)
+./cli sync --overwrite
+
+# Sync using Node.js implementation
+./cli --node sync
+```
+
+### list-drives
+
+List all shared drives accessible to the user.
+
+```bash
+./cli [--node] list-drives [options]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--credentials-fpath` | `-c` | Path to credentials JSON file |
+| `--token-path` | `-t` | Path to save/load OAuth token (default: `token.json`) |
+| `--token-server` | | URL of token server to fetch OAuth token from |
+| `--query` | `-q` | Search query to filter drives |
+
+**Examples:**
+
+```bash
+# List all shared drives
+./cli list-drives
+
+# Filter by name
+./cli list-drives --query "name contains 'Engineering'"
+
+# Filter by creation date
+./cli list-drives --query "createdTime > '2024-01-01'"
+```
+
+**Query Operators:**
+
+| Operator | Example | Description |
+|----------|---------|-------------|
+| `=` | `name = 'Engineering'` | Exact match |
+| `contains` | `name contains 'project'` | Partial match |
+| `>` / `>=` | `createdTime > '2024-01-01'` | Date/number comparison |
+| `and` | `name contains 'dev' and createdTime > '2024-01-01'` | Combine conditions |
 
 ### share
 
@@ -497,7 +590,8 @@ The tool maintains a `files-mapping.json` file that tracks both uploads and expo
       "drive_file_id": "1abc123xyz",
       "last_operation": "2025-12-02T10:30:00Z",
       "source_mimetype": "text/markdown",
-      "destination_mimetype": "application/vnd.google-apps.document"
+      "destination_mimetype": "application/vnd.google-apps.document",
+      "drive_id": "0ABC123DEF"
     }
   },
   "exports": {
@@ -505,11 +599,24 @@ The tool maintains a `files-mapping.json` file that tracks both uploads and expo
       "local_path": "/absolute/path/to/exported.md",
       "drive_file_id": "1abc123xyz",
       "last_operation": "2025-12-02T10:35:00Z",
-      "export_format": "md"
+      "export_format": "md",
+      "drive_id": "0ABC123DEF"
     }
   }
 }
 ```
+
+**Fields:**
+
+| Field | Description |
+|-------|-------------|
+| `local_path` | Absolute path to the local file |
+| `drive_file_id` | Google Drive file ID |
+| `last_operation` | ISO 8601 timestamp of last operation |
+| `source_mimetype` | MIME type of the source file (uploads only) |
+| `destination_mimetype` | MIME type for Drive conversion (uploads only) |
+| `export_format` | Export format used (exports only) |
+| `drive_id` | Shared drive ID if file is in a shared drive (optional) |
 
 This allows:
 
@@ -526,6 +633,49 @@ The tool automatically searches for `files-mapping.json` in the current director
 If no mapping file is found, a new one will be created in the current directory.
 
 You can override this behavior by specifying an explicit path with `--mapping-path`.
+
+## Shared Drives Support
+
+The tool fully supports Google Shared Drives (formerly Team Drives). All operations work seamlessly with files in shared drives.
+
+### Listing Shared Drives
+
+```bash
+# List all shared drives you have access to
+./cli list-drives
+
+# Filter by name
+./cli list-drives --query "name contains 'Engineering'"
+```
+
+### Uploading to Shared Drives
+
+```bash
+# Upload to a shared drive by name (uploads to root)
+./cli upload document.md --drive-name "Engineering"
+
+# Upload to a specific folder in a shared drive
+./cli upload document.md --folder-id FOLDER_ID --drive-id DRIVE_ID
+
+# Upload to shared drive root using drive ID
+./cli upload document.md --drive-id 0ABC123DEF
+```
+
+### Exporting from Shared Drives
+
+Files in shared drives can be exported normally using their file ID. To track the shared drive in the mapping file:
+
+```bash
+# Export and track the shared drive
+./cli export FILE_ID output.md --drive-name "Engineering"
+```
+
+### How It Works
+
+- The `--drive-name` option resolves the drive name to its ID automatically
+- The `--drive-id` is stored in `files-mapping.json` for tracking purposes
+- All API calls include `supportsAllDrives=true` for shared drive compatibility
+- Files in shared drives are owned by the drive, not individual users
 
 ## Token Server
 

@@ -41,6 +41,7 @@ class FileRecord(BaseModel):
     source_mimetype: Optional[str] = None
     destination_mimetype: Optional[str] = None
     export_format: Optional[str] = None  # For exports: the format used (e.g., 'md', 'docx')
+    drive_id: Optional[str] = None  # Shared drive ID (if file is in a shared drive)
 
 
 class FilesMapping(BaseModel):
@@ -248,10 +249,58 @@ def _resolve_mimetype(value: Optional[str]) -> Optional[str]:
     return MIME_TYPES.get(value.lower(), value)
 
 
+def _resolve_drive_id(drive, drive_name: str) -> str:
+    """Resolve a shared drive name to its ID.
+
+    Args:
+        drive: Google Drive API client
+        drive_name: Name of the shared drive
+
+    Returns:
+        The drive ID
+
+    Raises:
+        ValueError: If drive not found or multiple matches
+    """
+    # Escape single quotes in the name
+    escaped_name = drive_name.replace("'", "\\'")
+    response = drive.drives().list(
+        q=f"name = '{escaped_name}'",
+        fields="drives(id, name)",
+        pageSize=10
+    ).execute()
+
+    drives = response.get("drives", [])
+
+    if len(drives) == 0:
+        raise ValueError(f'Shared drive not found: "{drive_name}"')
+    if len(drives) > 1:
+        names = "\n".join(f"  - {d['name']} ({d['id']})" for d in drives)
+        raise ValueError(
+            f'Multiple shared drives match "{drive_name}":\n{names}\n'
+            "Please use --drive-id instead."
+        )
+
+    return drives[0]["id"]
+
+
+def _get_drive_id_from_options(drive, drive_id: Optional[str], drive_name: Optional[str]) -> Optional[str]:
+    """Get drive ID from either --drive-id or --drive-name option."""
+    if drive_id:
+        return drive_id
+    if drive_name:
+        return _resolve_drive_id(drive, drive_name)
+    return None
+
+
 def _get_upstream_modified_time(drive, file_id: str) -> Optional[datetime]:
     """Get the modification time of a file on Google Drive."""
     try:
-        response = drive.files().get(fileId=file_id, fields="modifiedTime").execute()
+        response = drive.files().get(
+            fileId=file_id,
+            fields="modifiedTime",
+            supportsAllDrives=True
+        ).execute()
         # Parse the ISO format datetime from Google Drive
         modified_time_str = response.get("modifiedTime")
         if modified_time_str:
@@ -304,8 +353,22 @@ def upload_file(
     token_path: Optional[str] = None,
     mapping_path: Optional[str] = None,
     overwrite: bool = False,
+    folder_id: Optional[str] = None,
+    drive_id: Optional[str] = None,
 ):
-    """Upload a file to Google Drive."""
+    """Upload a file to Google Drive (supports shared drives).
+
+    Args:
+        fpath: Path to file to upload
+        source_mimetype: MIME type of source file
+        destination_mimetype: MIME type for destination file in Drive
+        credentials_fpath: Path to credentials file
+        token_path: Path to token file
+        mapping_path: Path to files mapping file
+        overwrite: Skip upstream modification check
+        folder_id: Parent folder ID (can be a shared drive root or folder within)
+        drive_id: Shared drive ID (for tracking in mapping)
+    """
     creds = get_credentials(credentials_fpath, token_path)
     drive = build("drive", "v3", credentials=creds)
     if source_mimetype is None:
@@ -316,13 +379,20 @@ def upload_file(
     # Load existing mapping
     mapping = _load_mapping(mapping_path)
     abs_path = _get_absolute_path(fpath)
-    
-    metadata = {"name": os.path.basename(fpath), "mimeType": destination_mimetype}
+
+    metadata = {"name": os.path.basename(fpath)}
+    if destination_mimetype:
+        metadata["mimeType"] = destination_mimetype
+
+    # Set parent folder if provided (for shared drives or specific folders)
+    if folder_id:
+        metadata["parents"] = [folder_id]
+
     media = MediaFileUpload(fpath, mimetype=source_mimetype)
-    
+
     # Check if this file was previously uploaded
     existing_record = mapping.uploads.get(abs_path)
-    
+
     if existing_record:
         # Check for upstream modifications before updating
         if not overwrite:
@@ -343,13 +413,17 @@ def upload_file(
                     # Recreate media in case time passed
                     media = MediaFileUpload(fpath, mimetype=source_mimetype)
 
-        # Update existing file
+        # Update existing file (don't change parents on update)
+        update_metadata = {"name": metadata["name"]}
+        if destination_mimetype:
+            update_metadata["mimeType"] = destination_mimetype
         try:
             result = drive.files().update(
                 fileId=existing_record.drive_file_id,
-                body=metadata,
+                body=update_metadata,
                 media_body=media,
-                fields="id"
+                fields="id",
+                supportsAllDrives=True
             ).execute()
             # Update timestamp and mimetypes
             existing_record.last_operation = datetime.now(timezone.utc)
@@ -358,27 +432,39 @@ def upload_file(
             _save_mapping(mapping, mapping_path)
         except Exception:
             # If update fails (e.g., file was deleted), create a new one
-            result = drive.files().create(body=metadata, media_body=media, fields="id").execute()
+            result = drive.files().create(
+                body=metadata,
+                media_body=media,
+                fields="id",
+                supportsAllDrives=True
+            ).execute()
             mapping.uploads[abs_path] = FileRecord(
                 local_path=abs_path,
                 drive_file_id=result["id"],
                 last_operation=datetime.now(timezone.utc),
                 source_mimetype=source_mimetype,
                 destination_mimetype=destination_mimetype,
+                drive_id=drive_id,
             )
             _save_mapping(mapping, mapping_path)
     else:
         # Create new file
-        result = drive.files().create(body=metadata, media_body=media, fields="id").execute()
+        result = drive.files().create(
+            body=metadata,
+            media_body=media,
+            fields="id",
+            supportsAllDrives=True
+        ).execute()
         mapping.uploads[abs_path] = FileRecord(
             local_path=abs_path,
             drive_file_id=result["id"],
             last_operation=datetime.now(timezone.utc),
             source_mimetype=source_mimetype,
             destination_mimetype=destination_mimetype,
+            drive_id=drive_id,
         )
         _save_mapping(mapping, mapping_path)
-    
+
     return result
 
 
@@ -389,11 +475,22 @@ def export_file(
     credentials_fpath: Optional[str] = None,
     token_path: Optional[str] = None,
     mapping_path: Optional[str] = None,
+    drive_id: Optional[str] = None,
 ) -> str:
-    """Export a Google Workspace document to the specified format."""
+    """Export a Google Workspace document to the specified format (supports shared drives).
+
+    Args:
+        file_id: Google Drive file ID
+        output_path: Path where the exported file will be saved
+        export_format: Export format (default: 'md')
+        credentials_fpath: Path to credentials file
+        token_path: Path to token file
+        mapping_path: Path to files mapping file
+        drive_id: Shared drive ID (for tracking in mapping)
+    """
     creds = get_credentials(credentials_fpath, token_path)
     drive = build("drive", "v3", credentials=creds)
-    
+
     # Get the MIME type for the export format
     mime_type = EXPORT_MIME_TYPES.get(export_format)
     if mime_type is None:
@@ -401,15 +498,15 @@ def export_file(
             f"Invalid export format: {export_format}. "
             f"Supported formats: {', '.join(EXPORT_MIME_TYPES.keys())}"
         )
-    
+
     # Export the file
     request = drive.files().export(fileId=file_id, mimeType=mime_type)
     content = request.execute()
-    
+
     # Write to output file
     # For text formats, decode as UTF-8; for binary formats, write as bytes
     text_formats = {"md", "txt", "csv", "tsv", "rtf", "json", "svg"}
-    
+
     if export_format in text_formats:
         with open(output_path, "w", encoding="utf-8") as f:
             if isinstance(content, bytes):
@@ -422,7 +519,7 @@ def export_file(
                 f.write(content)
             else:
                 f.write(content.encode("utf-8"))
-    
+
     # Record the export in the mapping
     abs_output_path = _get_absolute_path(output_path)
     mapping = _load_mapping(mapping_path)
@@ -431,9 +528,10 @@ def export_file(
         drive_file_id=file_id,
         last_operation=datetime.now(timezone.utc),
         export_format=export_format,
+        drive_id=drive_id,
     )
     _save_mapping(mapping, mapping_path)
-    
+
     return output_path
 
 
@@ -585,7 +683,8 @@ def push_all(
                 fileId=record.drive_file_id,
                 body=metadata,
                 media_body=media,
-                fields="id"
+                fields="id",
+                supportsAllDrives=True
             ).execute()
             
             # Update timestamp
@@ -661,6 +760,7 @@ def share_file(
             body=permission,
             sendNotificationEmail=notify,
             fields="id,type,role,emailAddress",
+            supportsAllDrives=True,
         ).execute()
         
         results.append(result)
@@ -1478,16 +1578,57 @@ def upload(
             help="URL of token server to fetch OAuth token from"
         )
     ] = None,
+    folder_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--folder-id",
+            help="Parent folder ID to upload into (can be a shared drive root or folder within)"
+        )
+    ] = None,
+    drive_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--drive-id",
+            help="Shared drive ID (for tracking; use --folder-id for the actual destination)"
+        )
+    ] = None,
+    drive_name: Annotated[
+        Optional[str],
+        typer.Option(
+            "--drive-name",
+            help="Shared drive name (resolved to ID; use --folder-id for the actual destination)"
+        )
+    ] = None,
 ):
-    """Upload a file to Google Drive."""
+    """Upload a file to Google Drive (supports shared drives).
+
+    Examples:
+        python main.py upload myfile.md
+        python main.py upload myfile.md --drive-name "My Shared Drive"
+        python main.py upload myfile.md --folder-id FOLDER_ID --drive-id DRIVE_ID
+    """
     async def _upload():
         # If token-server is provided, fetch token from server first
         if token_server:
             _fetch_token_from_server(token_server, token_path)
+
+        # Resolve drive name to ID if provided
+        resolved_drive_id = drive_id
+        if drive_name and not resolved_drive_id:
+            creds = get_credentials(credentials_fpath, token_path)
+            drive = build("drive", "v3", credentials=creds)
+            resolved_drive_id = _resolve_drive_id(drive, drive_name)
+
+        # If drive ID is provided but no folder ID, use drive ID as folder (upload to root of shared drive)
+        resolved_folder_id = folder_id or resolved_drive_id
+
         # Resolve short aliases to full MIME types
         resolved_source = _resolve_mimetype(source_mimetype)
         resolved_dest = _resolve_mimetype(destination_mimetype)
-        file = await asyncify(upload_file)(fpath, resolved_source, resolved_dest, credentials_fpath, token_path, mapping_path, overwrite)
+        file = await asyncify(upload_file)(
+            fpath, resolved_source, resolved_dest, credentials_fpath, token_path,
+            mapping_path, overwrite, resolved_folder_id, resolved_drive_id
+        )
         print(file["id"])
 
     asyncio.run(_upload())
@@ -1506,9 +1647,9 @@ def export(
         )
     ] = "md",
     credentials_fpath: Annotated[
-        Optional[str], 
+        Optional[str],
         typer.Option(
-            "--credentials-fpath", 
+            "--credentials-fpath",
             "-c",
             help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
         )
@@ -1536,24 +1677,49 @@ def export(
             help="URL of token server to fetch OAuth token from"
         )
     ] = None,
+    drive_id: Annotated[
+        Optional[str],
+        typer.Option(
+            "--drive-id",
+            help="Shared drive ID (for tracking in the mapping file)"
+        )
+    ] = None,
+    drive_name: Annotated[
+        Optional[str],
+        typer.Option(
+            "--drive-name",
+            help="Shared drive name (resolved to ID for tracking)"
+        )
+    ] = None,
 ):
-    """Export a Google Workspace document to a local file.
-    
+    """Export a Google Workspace document to a local file (supports shared drives).
+
     Exports Google Docs, Sheets, Slides, Drawings, or Apps Script files to various formats.
     The default format is Markdown (md).
-    
+
     Examples:
         python main.py export 1abc123xyz output.md
         python main.py export 1abc123xyz document.docx --format docx
         python main.py export 1abc123xyz spreadsheet.csv --format csv
+        python main.py export 1abc123xyz output.md --drive-name "My Shared Drive"
     """
     async def _export():
         # If token-server is provided, fetch token from server first
         if token_server:
             _fetch_token_from_server(token_server, token_path)
-        result = await asyncify(export_file)(file_id, output_path, format, credentials_fpath, token_path, mapping_path)
+
+        # Resolve drive name to ID if provided
+        resolved_drive_id = drive_id
+        if drive_name and not resolved_drive_id:
+            creds = get_credentials(credentials_fpath, token_path)
+            drive = build("drive", "v3", credentials=creds)
+            resolved_drive_id = _resolve_drive_id(drive, drive_name)
+
+        result = await asyncify(export_file)(
+            file_id, output_path, format, credentials_fpath, token_path, mapping_path, resolved_drive_id
+        )
         print(f"Exported to: {result}")
-    
+
     asyncio.run(_export())
 
 
@@ -1846,6 +2012,84 @@ def sync(
         print(f"Files pushed: {len(push_results)}")
 
     asyncio.run(_sync())
+
+
+@app.command("list-drives")
+def list_drives(
+    credentials_fpath: Annotated[
+        Optional[str],
+        typer.Option(
+            "--credentials-fpath",
+            "-c",
+            help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
+        )
+    ] = None,
+    token_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-path",
+            "-t",
+            help=f"Path to save/load OAuth token. Can also be set via {TOKEN_ENV_VAR} env var. Default: {DEFAULT_TOKEN_PATH}"
+        )
+    ] = None,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
+    query: Annotated[
+        Optional[str],
+        typer.Option(
+            "--query",
+            "-q",
+            help="Search query (e.g., \"name contains 'project'\")"
+        )
+    ] = None,
+):
+    """List all shared drives accessible to the user.
+
+    Examples:
+        python main.py list-drives
+        python main.py list-drives --query "name contains 'project'"
+    """
+    if token_server:
+        _fetch_token_from_server(token_server, token_path)
+
+    creds = get_credentials(credentials_fpath, token_path)
+    drive = build("drive", "v3", credentials=creds)
+
+    all_drives = []
+    page_token = None
+
+    while True:
+        params = {
+            "pageSize": 100,
+            "fields": "nextPageToken, drives(id, name, createdTime)",
+        }
+        if query:
+            params["q"] = query
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = drive.drives().list(**params).execute()
+        all_drives.extend(response.get("drives", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    if not all_drives:
+        print("No shared drives found.")
+    else:
+        print("Shared Drives:\n")
+        for d in all_drives:
+            print(f"  {d['name']}")
+            print(f"    ID: {d['id']}")
+            if d.get("createdTime"):
+                print(f"    Created: {d['createdTime']}")
+            print("")
+        print(f"Total: {len(all_drives)} shared drive(s)")
 
 
 @app.command()
