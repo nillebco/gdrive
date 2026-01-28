@@ -1764,6 +1764,91 @@ def push(
 
 
 @app.command()
+def sync(
+    credentials_fpath: Annotated[
+        Optional[str],
+        typer.Option(
+            "--credentials-fpath",
+            "-c",
+            help=f"Path to credentials JSON file. Can also be set via {CREDENTIALS_ENV_VAR} env var"
+        )
+    ] = None,
+    token_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-path",
+            "-t",
+            help=f"Path to save/load OAuth token. Can also be set via {TOKEN_ENV_VAR} env var. Default: {DEFAULT_TOKEN_PATH}"
+        )
+    ] = None,
+    mapping_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--mapping-path",
+            "-m",
+            help=f"Path to files mapping JSON. Default: {DEFAULT_MAPPING_PATH}"
+        )
+    ] = None,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Skip upstream modification check and overwrite without prompting"
+        )
+    ] = False,
+    token_server: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-server",
+            help="URL of token server to fetch OAuth token from"
+        )
+    ] = None,
+):
+    """Sync all documents: first pull (re-export), then push (re-upload).
+
+    This command combines pull and push operations to synchronize your
+    local files with Google Drive. It first re-exports all previously
+    exported documents, then re-uploads all previously uploaded files.
+
+    Examples:
+        python main.py sync
+        python main.py sync --mapping-path custom-mapping.json
+        python main.py sync --overwrite
+    """
+    async def _sync():
+        # If token-server is provided, fetch token from server first
+        if token_server:
+            _fetch_token_from_server(token_server, token_path)
+
+        # First, pull (re-export all documents)
+        print("--- Pull (re-exporting documents) ---")
+        pull_results = await asyncify(pull_all)(credentials_fpath, token_path, mapping_path)
+        if not pull_results:
+            print("No previously exported documents found.")
+        else:
+            for path in pull_results:
+                print(f"Re-exported: {path}")
+            print(f"Pull complete: {len(pull_results)} document(s) re-exported.\n")
+
+        # Then, push (re-upload all files)
+        print("--- Push (re-uploading files) ---")
+        push_results = await asyncify(push_all)(credentials_fpath, token_path, mapping_path, overwrite)
+        if not push_results:
+            print("No previously uploaded files found.")
+        else:
+            for path in push_results:
+                print(f"Re-uploaded: {path}")
+            print(f"Push complete: {len(push_results)} file(s) re-uploaded.\n")
+
+        # Summary
+        print("--- Sync Summary ---")
+        print(f"Documents pulled: {len(pull_results)}")
+        print(f"Files pushed: {len(push_results)}")
+
+    asyncio.run(_sync())
+
+
+@app.command()
 def server(
     port: Annotated[
         int,

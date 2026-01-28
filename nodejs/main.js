@@ -1034,6 +1034,65 @@ program
     }
   });
 
+// Sync command (pull + push)
+program
+  .command('sync')
+  .description('Sync all documents: first pull (re-export), then push (re-upload)')
+  .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
+  .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
+  .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
+  .option('--overwrite', 'Skip upstream modification check and overwrite without prompting')
+  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .action(async (options) => {
+    try {
+      // If token-server is provided, fetch token from server first
+      if (options.tokenServer) {
+        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      }
+
+      // First, pull (re-export all documents)
+      console.log('--- Pull (re-exporting documents) ---');
+      const pullResults = await pullAll(
+        options.credentialsFpath,
+        options.tokenPath,
+        options.mappingPath
+      );
+      if (pullResults.length === 0) {
+        console.log('No previously exported documents found.');
+      } else {
+        for (const filePath of pullResults) {
+          console.log(`Re-exported: ${filePath}`);
+        }
+        console.log(`Pull complete: ${pullResults.length} document(s) re-exported.\n`);
+      }
+
+      // Then, push (re-upload all files)
+      console.log('--- Push (re-uploading files) ---');
+      const pushResults = await pushAll(
+        options.credentialsFpath,
+        options.tokenPath,
+        options.mappingPath,
+        options.overwrite || false
+      );
+      if (pushResults.length === 0) {
+        console.log('No previously uploaded files found.');
+      } else {
+        for (const filePath of pushResults) {
+          console.log(`Re-uploaded: ${filePath}`);
+        }
+        console.log(`Push complete: ${pushResults.length} file(s) re-uploaded.\n`);
+      }
+
+      // Summary
+      console.log('--- Sync Summary ---');
+      console.log(`Documents pulled: ${pullResults.length}`);
+      console.log(`Files pushed: ${pushResults.length}`);
+    } catch (error) {
+      console.error('Error:', error.message);
+      process.exit(1);
+    }
+  });
+
 // ============================================================================
 // Token Server Functionality
 // ============================================================================
