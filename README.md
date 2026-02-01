@@ -741,21 +741,30 @@ The token server allows users without their own Google Cloud credentials to auth
 
 ### Setting Up a Token Server
 
+The server accepts **Web application** or **Desktop (installed)** OAuth credentials (both Python and Node.js implementations). For running a token server, **Web application** is recommended.
+
 1. **Create OAuth credentials** in Google Cloud Console:
    - Go to [APIs & Services > Credentials](https://console.cloud.google.com/apis/credentials)
-   - Create an OAuth 2.0 Client ID (Web application type)
-   - Add `http://localhost:8080/auth/callback` to Authorized redirect URIs
-   - For production, also add your server's public URL
+   - Create an OAuth 2.0 Client ID (**Web application** type for the server)
+   - Enable the Google Drive API for the project
+   - Under **Authorized redirect URIs**, add the exact callback URL your server will use:
+     - For default port: `http://localhost:8080/auth/callback`
+     - For a custom port (e.g. 3000): `http://localhost:3000/auth/callback`
+   - For production, also add your server’s public callback URL (e.g. `https://your-server.example.com/auth/callback`)
+
+   The server builds the callback URL from each request’s **Host** (or **X-Forwarded-Host** / **X-Forwarded-Proto** when behind a reverse proxy), so the redirect URI matches how users reach the server. When using a proxy, ensure it forwards these headers.
 
 2. **Start the server**:
    ```bash
-   # Using credentials from environment variable
-   export GOOGLE_CREDENTIALS='{"installed":{"client_id":"...","client_secret":"..."}}'
-   ./cli server --port 8080
-
-   # Using credentials from file
+   # Using credentials from file (download the JSON from GCP Console; it has a "web" key)
    ./cli server -c credentials.json --port 8080
+
+   # Using credentials from environment variable (Web application format)
+   export GOOGLE_CREDENTIALS='{"web":{"client_id":"...","client_secret":"...","redirect_uris":["http://localhost:8080/auth/callback"]}}'
+   ./cli server --port 8080
    ```
+
+   Desktop (installed) credentials also work: the server accepts either `"web"` or `"installed"` in the credentials JSON.
 
 3. **Share the URL** with your users (e.g., `http://your-server:8080`)
 

@@ -215,6 +215,18 @@ def _get_stored_account_email(token_path: Optional[str] = None) -> Optional[str]
     return None
 
 
+def _get_oauth_client_config(data: dict) -> Optional[dict]:
+    """Return OAuth client config from Desktop (installed) or Web application credentials.
+
+    Args:
+        data: Full credentials JSON dict (has 'installed' or 'web' key).
+
+    Returns:
+        The client config dict (client_id, client_secret, redirect_uris, ...) or None.
+    """
+    return data.get("installed") or data.get("web")
+
+
 def _get_client_credentials(credentials_path: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     """Extract client_id and client_secret from credentials source.
 
@@ -234,9 +246,9 @@ def _get_client_credentials(credentials_path: Optional[str] = None) -> tuple[Opt
         with open(credentials_path, "r") as f:
             data = json.load(f)
 
-    if data and "installed" in data:
-        installed = data["installed"]
-        return installed.get("client_id"), installed.get("client_secret")
+    config = _get_oauth_client_config(data) if data else None
+    if config:
+        return config.get("client_id"), config.get("client_secret")
 
     return None, None
 
@@ -245,10 +257,10 @@ def _get_credentials_client_secret_from_dict(
     data: dict, token_path: Optional[str] = None
 ) -> OAuthCredentials:
     """Get OAuth credentials, using cached token if available."""
-    # Extract client_id and client_secret from credentials data
-    installed = data.get("installed", {})
-    client_id = installed.get("client_id")
-    client_secret = installed.get("client_secret")
+    # Extract client_id and client_secret from Desktop (installed) or Web credentials
+    client_config = _get_oauth_client_config(data) or {}
+    client_id = client_config.get("client_id")
+    client_secret = client_config.get("client_secret")
 
     # Try to load existing token (inject client creds for refresh capability)
     creds = _load_token(token_path, client_id=client_id, client_secret=client_secret)
@@ -267,7 +279,12 @@ def _get_credentials_client_secret_from_dict(
         except Exception:
             pass  # Fall through to new OAuth flow
 
-    # Run OAuth flow
+    # Run OAuth flow (InstalledAppFlow expects "installed"; "web" is for token server only)
+    if "installed" not in data:
+        raise ValueError(
+            "Web application credentials are for use with the token server (./cli server). "
+            "For local login use Desktop (installed) OAuth credentials."
+        )
     flow = InstalledAppFlow.from_client_config(data, SCOPES)
     creds = flow.run_local_server(port=0)
 
@@ -282,7 +299,7 @@ def _get_credentials_service_account_from_dict(data: dict) -> ServiceAccountCred
 
 
 def _detect_credentials_type(data: dict) -> str:
-    if "installed" in data:
+    if "installed" in data or "web" in data:
         return "client_secret"
     return "service_account"
 
@@ -1373,6 +1390,19 @@ def _fetch_token_from_server(server_url: str, token_path: Optional[str] = None) 
         raise RuntimeError("Failed to receive token")
 
 
+def _request_base_url(handler: BaseHTTPRequestHandler, fallback_port: int) -> str:
+    """Build base URL from request (Host / X-Forwarded-*), for redirect_uri and links."""
+    # Prefer proxy headers when behind reverse proxy (e.g. HTTPS in production)
+    proto = handler.headers.get("X-Forwarded-Proto") or "http"
+    proto = proto.split(",")[0].strip().lower() or "http"
+    host = handler.headers.get("X-Forwarded-Host") or handler.headers.get("Host")
+    if host:
+        host = host.split(",")[0].strip()
+    if not host:
+        host = f"localhost:{fallback_port}"
+    return f"{proto}://{host}"
+
+
 class TokenServerHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the token server."""
     
@@ -1392,10 +1422,10 @@ class TokenServerHandler(BaseHTTPRequestHandler):
         self.send_response(302)
         self.send_header('Location', location)
         self.end_headers()
-    
+
     def do_GET(self):
         parsed = urlparse(self.path)
-        base_url = f"http://localhost:{self.port}"
+        base_url = _request_base_url(self, self.port)
         
         try:
             # Landing page
@@ -1483,7 +1513,7 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                     }
                     if creds.expiry:
                         token['expiry'] = creds.expiry.isoformat()
-                    
+
                     # Check if there's a CLI callback waiting
                     session = pending_sessions.get(state)
                     if session and session.get('callback'):
@@ -1510,7 +1540,7 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(b'{"status": "ok"}')
                 return
-            
+
             # 404
             self.send_response(404)
             self.send_header('Content-Type', 'text/plain')
@@ -1541,9 +1571,9 @@ def start_token_server(port: int, credentials_fpath: Optional[str] = None):
             f"Credentials required. Set {CREDENTIALS_ENV_VAR} env var or use --credentials-fpath"
         )
     
-    # Validate credentials
-    creds_data = credentials.get('installed') or credentials.get('web')
-    if not creds_data or not creds_data.get('client_id') or not creds_data.get('client_secret'):
+    # Validate credentials (server supports both Desktop "installed" and Web application "web")
+    creds_data = _get_oauth_client_config(credentials)
+    if not creds_data or not creds_data.get("client_id") or not creds_data.get("client_secret"):
         raise ValueError("Invalid credentials: missing client_id or client_secret")
     
     # Configure handler

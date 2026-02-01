@@ -463,13 +463,24 @@ async function runOAuthFlow(oauth2Client, tokenPath = null) {
 }
 
 /**
+ * Return OAuth client config from Desktop (installed) or Web application credentials.
+ * Used by token server and credential loading; server supports both types.
+ * @param {object} credentials - Full credentials JSON (has 'installed' or 'web' key)
+ * @returns {object|null} Client config (client_id, client_secret, redirect_uris, ...) or null
+ */
+function getOAuthClientConfig(credentials) {
+  return credentials?.installed || credentials?.web || null;
+}
+
+/**
  * Get OAuth credentials from client secret config.
- * @param {object} data - Client secret config
+ * @param {object} data - Client secret config (has 'installed' or 'web' key)
  * @param {string|null} tokenPath - Optional path to token file
  * @returns {Promise<google.auth.OAuth2>} Authenticated OAuth2 client
  */
 async function getCredentialsClientSecretFromDict(data, tokenPath = null) {
-  const { client_id, client_secret, redirect_uris } = data.installed || data.web;
+  const clientConfig = getOAuthClientConfig(data);
+  const { client_id, client_secret, redirect_uris } = clientConfig || {};
 
   const oauth2Client = new google.auth.OAuth2(
     client_id,
@@ -523,7 +534,7 @@ function getCredentialsServiceAccountFromDict(data) {
  * @returns {string} 'client_secret' or 'service_account'
  */
 function detectCredentialsType(data) {
-  if (data.installed || data.web) {
+  if (getOAuthClientConfig(data)) {
     return 'client_secret';
   }
   return 'service_account';
@@ -1883,14 +1894,20 @@ async function startTokenServer(port, credentialsFpath = null) {
     );
   }
 
-  const { client_id, client_secret } = credentials.installed || credentials.web;
-  if (!client_id || !client_secret) {
+  // Server supports both Desktop (installed) and Web application credentials
+  const credsData = getOAuthClientConfig(credentials);
+  if (!credsData?.client_id || !credsData?.client_secret) {
     throw new Error('Invalid credentials: missing client_id or client_secret');
   }
+  const { client_id, client_secret } = credsData;
 
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://localhost:${port}`);
-    const baseUrl = `http://localhost:${port}`;
+    // Build base URL from request (Host / X-Forwarded-*) for redirect_uri and links
+    const proto = (req.headers['x-forwarded-proto'] || 'http').split(',')[0].trim().toLowerCase() || 'http';
+    const host = (req.headers['x-forwarded-host'] || req.headers.host || `localhost:${port}`).split(',')[0].trim();
+    const baseUrl = `${proto}://${host}`;
+
+    const url = new URL(req.url, baseUrl);
 
     try {
       // Landing page
@@ -2054,8 +2071,9 @@ program
                 }
               }
 
-              if (credentials && (credentials.installed || credentials.web)) {
-                const { client_id, client_secret } = credentials.installed || credentials.web;
+              const clientConfig = credentials && getOAuthClientConfig(credentials);
+              if (clientConfig) {
+                const { client_id, client_secret } = clientConfig;
                 const oauth2Client = new google.auth.OAuth2(client_id, client_secret);
                 oauth2Client.setCredentials(existingToken);
                 const { credentials: newCredentials } = await oauth2Client.refreshAccessToken();
