@@ -7,3 +7,4 @@ backend = "rbw"
 
 [secrets]
 GOOGLE_CREDENTIALS = { value = "drive-cli-client-id-and-secret/notes", provider = "bitwarden-personal" }
+#GOOGLE_CREDENTIALS = { value = "drive-nilleb-com-client-id-and-secret/notes", provider = "bitwarden-personal" }
