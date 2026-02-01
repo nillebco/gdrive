@@ -25,12 +25,20 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 CREDENTIALS_ENV_VAR = "GOOGLE_CREDENTIALS"
 TOKEN_ENV_VAR = "GOOGLE_TOKEN"
+TOKEN_SERVER_ENV_VAR = "GDRIVE_TOKEN_SERVER"
 DEFAULT_TOKEN_PATH = "token.json"
 DEFAULT_MAPPING_PATH = "files-mapping.json"
 DEFAULT_SERVER_PORT = 8080
 
 # Token server: in-memory store for pending OAuth sessions
 pending_sessions: dict[str, dict] = {}
+
+
+def _get_token_server(token_server: Optional[str]) -> Optional[str]:
+    """Get token server URL from CLI option or environment variable."""
+    if token_server:
+        return token_server
+    return os.environ.get(TOKEN_SERVER_ENV_VAR)
 
 
 class FileRecord(BaseModel):
@@ -126,54 +134,146 @@ def _get_absolute_path(fpath: str) -> str:
     return os.path.abspath(fpath)
 
 
-def _load_token(token_path: Optional[str] = None) -> Optional[OAuthCredentials]:
-    """Load saved OAuth token from file or environment variable."""
+def _load_token(
+    token_path: Optional[str] = None,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None
+) -> Optional[OAuthCredentials]:
+    """Load saved OAuth token from file or environment variable.
+
+    Args:
+        token_path: Path to token.json file
+        client_id: OAuth client ID (required for token refresh)
+        client_secret: OAuth client secret (required for token refresh)
+    """
+    token_data = None
+
     # Try environment variable first
     token_json = os.environ.get(TOKEN_ENV_VAR)
     if token_json:
         token_data = json.loads(token_json)
+    else:
+        # Try file
+        path = token_path or DEFAULT_TOKEN_PATH
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                token_data = json.load(f)
+
+    if token_data is None:
+        return None
+
+    # Inject client_id and client_secret if not present (required by the library)
+    if client_id and "client_id" not in token_data:
+        token_data["client_id"] = client_id
+    if client_secret and "client_secret" not in token_data:
+        token_data["client_secret"] = client_secret
+
+    try:
         return OAuthCredentials.from_authorized_user_info(token_data, SCOPES)
-    
-    # Try file
+    except ValueError:
+        # Token data is incomplete (missing client_id/client_secret)
+        return None
+
+
+def _save_token(creds: OAuthCredentials, token_path: Optional[str] = None, account_email: Optional[str] = None):
+    """Save OAuth token to file for future use."""
+    path = token_path or DEFAULT_TOKEN_PATH
+    # Parse the credentials JSON and add account_email if provided
+    token_data = json.loads(creds.to_json())
+    # Remove client_id and client_secret - they should come from GOOGLE_CREDENTIALS
+    token_data.pop("client_id", None)
+    token_data.pop("client_secret", None)
+    if account_email:
+        token_data["account_email"] = account_email
+    with open(path, "w") as f:
+        json.dump(token_data, f, indent=2)
+
+
+def _fetch_user_email(access_token: str) -> Optional[str]:
+    """Fetch the authenticated user's email from Google's userinfo API."""
+    import urllib.request
+    import urllib.error
+    try:
+        req = urllib.request.Request(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            return data.get("email")
+    except Exception:
+        return None
+
+
+def _get_stored_account_email(token_path: Optional[str] = None) -> Optional[str]:
+    """Get the account email from the stored token."""
     path = token_path or DEFAULT_TOKEN_PATH
     if os.path.exists(path):
         with open(path, "r") as f:
             token_data = json.load(f)
-        return OAuthCredentials.from_authorized_user_info(token_data, SCOPES)
-    
+        return token_data.get("account_email")
     return None
 
 
-def _save_token(creds: OAuthCredentials, token_path: Optional[str] = None):
-    """Save OAuth token to file for future use."""
-    path = token_path or DEFAULT_TOKEN_PATH
-    with open(path, "w") as f:
-        f.write(creds.to_json())
+def _get_client_credentials(credentials_path: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """Extract client_id and client_secret from credentials source.
+
+    Args:
+        credentials_path: Path to credentials JSON file
+
+    Returns:
+        Tuple of (client_id, client_secret), both may be None if not found
+    """
+    data = None
+
+    # Try environment variable first
+    credentials_json = os.environ.get(CREDENTIALS_ENV_VAR)
+    if credentials_json:
+        data = json.loads(credentials_json)
+    elif credentials_path and os.path.exists(credentials_path):
+        with open(credentials_path, "r") as f:
+            data = json.load(f)
+
+    if data and "installed" in data:
+        installed = data["installed"]
+        return installed.get("client_id"), installed.get("client_secret")
+
+    return None, None
 
 
 def _get_credentials_client_secret_from_dict(
     data: dict, token_path: Optional[str] = None
 ) -> OAuthCredentials:
     """Get OAuth credentials, using cached token if available."""
-    # Try to load existing token
-    creds = _load_token(token_path)
-    
+    # Extract client_id and client_secret from credentials data
+    installed = data.get("installed", {})
+    client_id = installed.get("client_id")
+    client_secret = installed.get("client_secret")
+
+    # Try to load existing token (inject client creds for refresh capability)
+    creds = _load_token(token_path, client_id=client_id, client_secret=client_secret)
+
     if creds and creds.valid:
         return creds
-    
+
     # Try to refresh expired token
     if creds and creds.expired and creds.refresh_token:
         try:
+            # Preserve existing account email
+            existing_email = _get_stored_account_email(token_path)
             creds.refresh(Request())
-            _save_token(creds, token_path)
+            _save_token(creds, token_path, existing_email)
             return creds
         except Exception:
             pass  # Fall through to new OAuth flow
-    
+
     # Run OAuth flow
     flow = InstalledAppFlow.from_client_config(data, SCOPES)
     creds = flow.run_local_server(port=0)
-    _save_token(creds, token_path)
+
+    # Fetch user email and save with token
+    account_email = _fetch_user_email(creds.token)
+    _save_token(creds, token_path, account_email)
     return creds
 
 
@@ -1466,7 +1566,7 @@ def login(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
     force: Annotated[
@@ -1489,24 +1589,35 @@ def login(
         python main.py login --force
         python main.py login --token-server http://your-server:8080
     """
-    # If token-server is provided, fetch token from server
-    if token_server:
-        _fetch_token_from_server(token_server, token_path)
+    # If token-server is provided (via CLI or env var), fetch token from server
+    server_url = _get_token_server(token_server)
+    if server_url:
+        _fetch_token_from_server(server_url, token_path)
+        account_email = _get_stored_account_email(token_path)
+        if account_email:
+            print(f"Logged in as: {account_email}")
         return
 
     # Check for existing valid token
     if not force:
-        existing_token = _load_token(token_path)
+        client_id, client_secret = _get_client_credentials(credentials_fpath)
+        existing_token = _load_token(token_path, client_id=client_id, client_secret=client_secret)
         if existing_token and existing_token.valid:
             print("Already authenticated. Use --force to re-authenticate.")
+            account_email = _get_stored_account_email(token_path)
+            if account_email:
+                print(f"Logged in as: {account_email}")
             return
 
         # Try to refresh expired token
         if existing_token and existing_token.expired and existing_token.refresh_token:
             try:
+                existing_email = _get_stored_account_email(token_path)
                 existing_token.refresh(Request())
-                _save_token(existing_token, token_path)
+                _save_token(existing_token, token_path, existing_email)
                 print("Token refreshed successfully.")
+                if existing_email:
+                    print(f"Logged in as: {existing_email}")
                 return
             except Exception:
                 pass  # Fall through to new OAuth flow
@@ -1516,9 +1627,64 @@ def login(
         get_credentials(credentials_fpath, token_path)
         path = token_path or DEFAULT_TOKEN_PATH
         print(f"Authentication successful. Token saved to {path}")
+        account_email = _get_stored_account_email(token_path)
+        if account_email:
+            print(f"Logged in as: {account_email}")
     except Exception as e:
         print(f"Authentication failed: {e}")
         raise typer.Exit(code=1)
+
+
+@app.command()
+def whoami(
+    credentials_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--credentials-path",
+            "-c",
+            help=f"Path to credentials JSON. Can also be set via {CREDENTIALS_ENV_VAR} env var."
+        )
+    ] = None,
+    token_path: Annotated[
+        Optional[str],
+        typer.Option(
+            "--token-path",
+            "-t",
+            help=f"Path to OAuth token. Can also be set via {TOKEN_ENV_VAR} env var. Default: {DEFAULT_TOKEN_PATH}"
+        )
+    ] = None,
+):
+    """Show the currently authenticated Google account.
+
+    Examples:
+        python main.py whoami
+    """
+    path = token_path or DEFAULT_TOKEN_PATH
+
+    if not os.path.exists(path) and not os.environ.get(TOKEN_ENV_VAR):
+        print("Not logged in. Run 'gdrive login' to authenticate.")
+        raise typer.Exit(code=1)
+
+    # Check for stored email
+    account_email = _get_stored_account_email(token_path)
+    if account_email:
+        print(account_email)
+        return
+
+    # Try to fetch email from API using full credentials
+    try:
+        creds = get_credentials(credentials_path, token_path)
+        if creds and hasattr(creds, 'token') and creds.token:
+            email = _fetch_user_email(creds.token)
+            if email:
+                # Update token file with email
+                _save_token(creds, token_path, email)
+                print(email)
+                return
+    except Exception:
+        pass  # Fall through to generic message
+
+    print("Logged in (email not available)")
 
 
 @app.command()
@@ -1575,7 +1741,7 @@ def upload(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
     folder_id: Annotated[
@@ -1608,9 +1774,10 @@ def upload(
         python main.py upload myfile.md --folder-id FOLDER_ID --drive-id DRIVE_ID
     """
     async def _upload():
-        # If token-server is provided, fetch token from server first
-        if token_server:
-            _fetch_token_from_server(token_server, token_path)
+        # If token-server is provided (via CLI or env var), fetch token from server first
+        server_url = _get_token_server(token_server)
+        if server_url:
+            _fetch_token_from_server(server_url, token_path)
 
         # Resolve drive name to ID if provided
         resolved_drive_id = drive_id
@@ -1674,7 +1841,7 @@ def export(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
     drive_id: Annotated[
@@ -1704,9 +1871,10 @@ def export(
         python main.py export 1abc123xyz output.md --drive-name "My Shared Drive"
     """
     async def _export():
-        # If token-server is provided, fetch token from server first
-        if token_server:
-            _fetch_token_from_server(token_server, token_path)
+        # If token-server is provided (via CLI or env var), fetch token from server first
+        server_url = _get_token_server(token_server)
+        if server_url:
+            _fetch_token_from_server(server_url, token_path)
 
         # Resolve drive name to ID if provided
         resolved_drive_id = drive_id
@@ -1770,7 +1938,7 @@ def share(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -1794,9 +1962,10 @@ def share(
         )
     
     async def _share():
-        # If token-server is provided, fetch token from server first
-        if token_server:
-            _fetch_token_from_server(token_server, token_path)
+        # If token-server is provided (via CLI or env var), fetch token from server first
+        server_url = _get_token_server(token_server)
+        if server_url:
+            _fetch_token_from_server(server_url, token_path)
         results = await asyncify(share_file)(fpath, emails, role, notify, credentials_fpath, token_path, mapping_path)
         for result in results:
             print(f"Shared with {result['emailAddress']} as {result['role']}")
@@ -1834,7 +2003,7 @@ def pull(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -1849,9 +2018,10 @@ def pull(
         python main.py pull --mapping-path custom-mapping.json
     """
     async def _pull():
-        # If token-server is provided, fetch token from server first
-        if token_server:
-            _fetch_token_from_server(token_server, token_path)
+        # If token-server is provided (via CLI or env var), fetch token from server first
+        server_url = _get_token_server(token_server)
+        if server_url:
+            _fetch_token_from_server(server_url, token_path)
         results = await asyncify(pull_all)(credentials_fpath, token_path, mapping_path)
         if not results:
             print("No previously exported documents found.")
@@ -1900,7 +2070,7 @@ def push(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -1915,9 +2085,10 @@ def push(
         python main.py push --overwrite
     """
     async def _push():
-        # If token-server is provided, fetch token from server first
-        if token_server:
-            _fetch_token_from_server(token_server, token_path)
+        # If token-server is provided (via CLI or env var), fetch token from server first
+        server_url = _get_token_server(token_server)
+        if server_url:
+            _fetch_token_from_server(server_url, token_path)
         results = await asyncify(push_all)(credentials_fpath, token_path, mapping_path, overwrite)
         if not results:
             print("No previously uploaded files found.")
@@ -1966,7 +2137,7 @@ def sync(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -1982,9 +2153,10 @@ def sync(
         python main.py sync --overwrite
     """
     async def _sync():
-        # If token-server is provided, fetch token from server first
-        if token_server:
-            _fetch_token_from_server(token_server, token_path)
+        # If token-server is provided (via CLI or env var), fetch token from server first
+        server_url = _get_token_server(token_server)
+        if server_url:
+            _fetch_token_from_server(server_url, token_path)
 
         # First, pull (re-export all documents)
         print("--- Pull (re-exporting documents) ---")
@@ -2036,7 +2208,7 @@ def list_drives(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from"
+            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
         )
     ] = None,
     query: Annotated[
@@ -2054,8 +2226,10 @@ def list_drives(
         python main.py list-drives
         python main.py list-drives --query "name contains 'project'"
     """
-    if token_server:
-        _fetch_token_from_server(token_server, token_path)
+    # If token-server is provided (via CLI or env var), fetch token from server first
+    server_url = _get_token_server(token_server)
+    if server_url:
+        _fetch_token_from_server(server_url, token_path)
 
     creds = get_credentials(credentials_fpath, token_path)
     drive = build("drive", "v3", credentials=creds)

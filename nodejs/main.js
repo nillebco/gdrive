@@ -13,12 +13,25 @@ import { Command } from 'commander';
 const SCOPES = ['https://www.googleapis.com/auth/drive'];
 const CREDENTIALS_ENV_VAR = 'GOOGLE_CREDENTIALS';
 const TOKEN_ENV_VAR = 'GOOGLE_TOKEN';
+const TOKEN_SERVER_ENV_VAR = 'GDRIVE_TOKEN_SERVER';
 const DEFAULT_TOKEN_PATH = 'token.json';
 const DEFAULT_MAPPING_PATH = 'files-mapping.json';
 const DEFAULT_SERVER_PORT = 8080;
 
 // Token server: in-memory store for pending OAuth sessions
 const pendingSessions = new Map();
+
+/**
+ * Get token server URL from CLI option or environment variable.
+ * @param {string|undefined} tokenServer - CLI option value
+ * @returns {string|undefined} Token server URL
+ */
+function getTokenServer(tokenServer) {
+  if (tokenServer) {
+    return tokenServer;
+  }
+  return process.env[TOKEN_SERVER_ENV_VAR];
+}
 
 const MIME_TYPES = {
   pdf: 'application/pdf',
@@ -336,12 +349,52 @@ function loadToken(tokenPath = null) {
 
 /**
  * Save OAuth token to file for future use.
+ * Excludes client_id and client_secret for security (they're in GOOGLE_CREDENTIALS).
  * @param {object} tokens - Token data to save
  * @param {string|null} tokenPath - Optional path to save token
+ * @param {string|null} accountEmail - Optional account email to store
  */
-function saveToken(tokens, tokenPath = null) {
+function saveToken(tokens, tokenPath = null, accountEmail = null) {
   const filePath = tokenPath || DEFAULT_TOKEN_PATH;
-  fs.writeFileSync(filePath, JSON.stringify(tokens, null, 2));
+  // Exclude client_id and client_secret - they should come from GOOGLE_CREDENTIALS
+  const { client_id, client_secret, ...tokenData } = tokens;
+  const dataToSave = { ...tokenData };
+  if (accountEmail) {
+    dataToSave.account_email = accountEmail;
+  }
+  fs.writeFileSync(filePath, JSON.stringify(dataToSave, null, 2));
+}
+
+/**
+ * Fetch the authenticated user's email from Google's userinfo API.
+ * @param {string} accessToken - OAuth access token
+ * @returns {Promise<string|null>} The user's email or null if fetch fails
+ */
+async function fetchUserEmail(accessToken) {
+  try {
+    const response = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+      },
+    });
+    if (response.ok) {
+      const data = await response.json();
+      return data.email || null;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get the account email from the stored token.
+ * @param {string|null} tokenPath - Optional path to token file
+ * @returns {string|null} The stored account email or null
+ */
+function getStoredAccountEmail(tokenPath = null) {
+  const tokenData = loadToken(tokenPath);
+  return tokenData?.account_email || null;
 }
 
 /**
@@ -366,7 +419,10 @@ async function runOAuthFlow(oauth2Client, tokenPath = null) {
 
           const { tokens } = await oauth2Client.getToken(code);
           oauth2Client.setCredentials(tokens);
-          saveToken(tokens, tokenPath);
+
+          // Fetch user email and save with token
+          const accountEmail = await fetchUserEmail(tokens.access_token);
+          saveToken(tokens, tokenPath, accountEmail);
           resolve(oauth2Client);
         } else {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -432,7 +488,8 @@ async function getCredentialsClientSecretFromDict(data, tokenPath = null) {
       if (tokenData.refresh_token) {
         try {
           const { credentials } = await oauth2Client.refreshAccessToken();
-          saveToken(credentials, tokenPath);
+          // Preserve the account email from the old token
+          saveToken(credentials, tokenPath, tokenData.account_email);
           return oauth2Client;
         } catch {
           // Fall through to new OAuth flow
@@ -927,15 +984,16 @@ program
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
   .option('--overwrite', 'Skip upstream modification check and overwrite without prompting')
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .option('--folder-id <id>', 'Parent folder ID to upload into (can be a shared drive root or folder within)')
   .option('--drive-id <id>', 'Shared drive ID (for tracking; use --folder-id for the actual destination)')
   .option('--drive-name <name>', 'Shared drive name (resolved to ID; use --folder-id for the actual destination)')
   .action(async (fpath, options) => {
     try {
-      // If token-server is provided, fetch token from server first
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server first
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
 
       // Resolve drive name to ID if provided
@@ -980,14 +1038,15 @@ program
   .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .option('--drive-id <id>', 'Shared drive ID (for tracking in the mapping file)')
   .option('--drive-name <name>', 'Shared drive name (resolved to ID for tracking)')
   .action(async (fileId, outputPath, options) => {
     try {
-      // If token-server is provided, fetch token from server first
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server first
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
 
       // Resolve drive name to ID if provided
@@ -1025,7 +1084,7 @@ program
   .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .action(async (fpath, emails, options) => {
     try {
       // Validate role
@@ -1034,11 +1093,12 @@ program
         throw new Error(`Invalid role: ${options.role}. Must be one of: ${validRoles.join(', ')}`);
       }
       
-      // If token-server is provided, fetch token from server first
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server first
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
-      
+
       const permissions = await shareFile(
         fpath,
         emails,
@@ -1065,12 +1125,13 @@ program
   .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .action(async (options) => {
     try {
-      // If token-server is provided, fetch token from server first
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server first
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
       const results = await pullAll(
         options.credentialsFpath,
@@ -1099,12 +1160,13 @@ program
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
   .option('--overwrite', 'Skip upstream modification check and overwrite without prompting')
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .action(async (options) => {
     try {
-      // If token-server is provided, fetch token from server first
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server first
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
       const results = await pushAll(
         options.credentialsFpath,
@@ -1134,12 +1196,13 @@ program
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
   .option('-m, --mapping-path <path>', `Path to files mapping JSON. Default: ${DEFAULT_MAPPING_PATH}`)
   .option('--overwrite', 'Skip upstream modification check and overwrite without prompting')
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .action(async (options) => {
     try {
-      // If token-server is provided, fetch token from server first
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server first
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
 
       // First, pull (re-export all documents)
@@ -1191,12 +1254,14 @@ program
   .description('List all shared drives accessible to the user')
   .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .option('-q, --query <query>', 'Search query (e.g., "name contains \'project\'")')
   .action(async (options) => {
     try {
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server first
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
       const auth = await getCredentials(options.credentialsFpath, options.tokenPath);
       const drive = google.drive({ version: 'v3', auth });
@@ -1949,13 +2014,14 @@ program
   .description('Authenticate with Google and save the OAuth token')
   .option('-c, --credentials-fpath <path>', `Path to credentials JSON file. Can also be set via ${CREDENTIALS_ENV_VAR} env var`)
   .option('-t, --token-path <path>', `Path to save/load OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
-  .option('--token-server <url>', 'URL of token server to fetch OAuth token from')
+  .option('--token-server <url>', `URL of token server to fetch OAuth token from. Can also be set via ${TOKEN_SERVER_ENV_VAR} env var`)
   .option('-f, --force', 'Force re-authentication even if a valid token exists')
   .action(async (options) => {
     try {
-      // If token-server is provided, fetch token from server
-      if (options.tokenServer) {
-        await fetchTokenFromServer(options.tokenServer, options.tokenPath);
+      // If token-server is provided (via CLI or env var), fetch token from server
+      const serverUrl = getTokenServer(options.tokenServer);
+      if (serverUrl) {
+        await fetchTokenFromServer(serverUrl, options.tokenPath);
         console.log('Authentication successful via token server.');
         return;
       }
@@ -1967,6 +2033,9 @@ program
           // Check if token is expired
           if (!existingToken.expiry_date || Date.now() < existingToken.expiry_date) {
             console.log('Already authenticated. Use --force to re-authenticate.');
+            if (existingToken.account_email) {
+              console.log(`Logged in as: ${existingToken.account_email}`);
+            }
             return;
           }
 
@@ -1990,8 +2059,12 @@ program
                 const oauth2Client = new google.auth.OAuth2(client_id, client_secret);
                 oauth2Client.setCredentials(existingToken);
                 const { credentials: newCredentials } = await oauth2Client.refreshAccessToken();
-                saveToken(newCredentials, options.tokenPath);
+                // Preserve account email from existing token
+                saveToken(newCredentials, options.tokenPath, existingToken.account_email);
                 console.log('Token refreshed successfully.');
+                if (existingToken.account_email) {
+                  console.log(`Logged in as: ${existingToken.account_email}`);
+                }
                 return;
               }
             } catch {
@@ -2004,9 +2077,51 @@ program
       // Run OAuth flow
       await getCredentials(options.credentialsFpath, options.tokenPath);
       const tokenPath = options.tokenPath || DEFAULT_TOKEN_PATH;
+      const savedToken = loadToken(tokenPath);
       console.log(`Authentication successful. Token saved to ${tokenPath}`);
+      if (savedToken?.account_email) {
+        console.log(`Logged in as: ${savedToken.account_email}`);
+      }
     } catch (error) {
       console.error('Authentication failed:', error.message);
+      process.exit(1);
+    }
+  });
+
+// Whoami command
+program
+  .command('whoami')
+  .description('Show the currently authenticated Google account')
+  .option('-t, --token-path <path>', `Path to OAuth token. Can also be set via ${TOKEN_ENV_VAR} env var. Default: ${DEFAULT_TOKEN_PATH}`)
+  .action(async (options) => {
+    try {
+      const tokenData = loadToken(options.tokenPath);
+      if (!tokenData) {
+        console.log('Not logged in. Run "gdrive login" to authenticate.');
+        process.exit(1);
+      }
+
+      // If we have a stored email, display it
+      if (tokenData.account_email) {
+        console.log(tokenData.account_email);
+        return;
+      }
+
+      // Otherwise, try to fetch it from the API
+      if (tokenData.access_token || tokenData.token) {
+        const accessToken = tokenData.access_token || tokenData.token;
+        const email = await fetchUserEmail(accessToken);
+        if (email) {
+          // Update the token file with the email
+          saveToken(tokenData, options.tokenPath, email);
+          console.log(email);
+          return;
+        }
+      }
+
+      console.log('Logged in (email not available)');
+    } catch (error) {
+      console.error('Error:', error.message);
       process.exit(1);
     }
   });

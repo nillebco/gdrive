@@ -1,0 +1,33 @@
+# Dependencies
+nodejs/node_modules/
+python/.venv/
+python/__pycache__/
+
+# Git
+.git
+.gitignore
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Token files
+token.json
+*-mapping.json
+
+# Documentation
+*.md
+!web/*.html
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.pyc
+*.pyo

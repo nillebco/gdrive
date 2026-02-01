@@ -10,6 +10,9 @@ Available in both Python and Node.js implementations.
 # Login to Google (first time setup)
 ./cli login
 
+# Check which account you're logged in as
+./cli whoami
+
 # Upload a file (Python, default)
 ./cli upload document.md
 
@@ -62,11 +65,15 @@ The tool supports three authentication methods:
 If someone in your organization runs a token server, you can authenticate without having your own Google Cloud credentials:
 
 ```bash
-# Authenticate via token server and upload a file
-./cli upload document.md --token-server http://your-server:8080
+# Set the token server URL once via environment variable
+export GDRIVE_TOKEN_SERVER=http://your-server:8080
 
-# The token is automatically saved for future use
-./cli upload another-doc.md
+# Then just use the CLI normally
+./cli login
+./cli upload document.md
+
+# Or pass it explicitly
+./cli upload document.md --token-server http://your-server:8080
 ```
 
 See [Token Server](#token-server) section for how to run your own server.
@@ -182,6 +189,32 @@ Authenticate with Google and save the OAuth token for future use.
 # Save token to custom path
 ./cli login --token-path ~/.config/gdrive/token.json
 ```
+
+### whoami
+
+Show the currently authenticated Google account.
+
+```bash
+./cli [--node] whoami [options]
+```
+
+**Options:**
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--token-path` | `-t` | Path to OAuth token (default: `token.json`) |
+
+**Examples:**
+
+```bash
+# Show current account
+./cli whoami
+
+# Check account with custom token path
+./cli whoami --token-path ~/.config/gdrive/token.json
+```
+
+The account email is stored in `token.json` when you authenticate and displayed automatically during login.
 
 ### server
 
@@ -577,6 +610,25 @@ Share an uploaded file with one or more email addresses.
 |----------|-------------|
 | `GOOGLE_CREDENTIALS` | JSON content of the credentials file (OAuth or Service Account) |
 | `GOOGLE_TOKEN` | JSON content of the OAuth token (alternative to `token.json` file) |
+| `GDRIVE_TOKEN_SERVER` | URL of token server for authentication (alternative to `--token-server` option) |
+
+## Token File
+
+The OAuth token is stored in `token.json` with the following structure:
+
+```json
+{
+  "token": "ya29...",
+  "refresh_token": "1//...",
+  "token_uri": "https://oauth2.googleapis.com/token",
+  "scopes": ["https://www.googleapis.com/auth/drive"],
+  "account_email": "user@example.com"
+}
+```
+
+Note: `client_id` and `client_secret` are **not** stored in `token.json`. They are read from the `GOOGLE_CREDENTIALS` environment variable or `credentials.json` file during authentication and token refresh operations.
+
+The `account_email` field is automatically fetched from Google's userinfo API during authentication and stored for quick identification. Use `./cli whoami` to see the current account.
 
 ## Files Mapping
 
