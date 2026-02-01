@@ -2,7 +2,7 @@
 
 import pytest
 
-from main import (
+from __main__ import (
     _detect_credentials_type,
     _get_oauth_client_config,
     _parse_credentials_json,

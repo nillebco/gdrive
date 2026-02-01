@@ -2,7 +2,7 @@
 
 import pytest
 
-from main import _request_base_url
+from __main__ import _request_base_url
 
 
 def _make_handler(headers: dict, port: int = 8080):

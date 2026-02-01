@@ -17,3 +17,5 @@ dev = [
     "ruff>=0.14.7",
 ]
 
+[project.scripts]
+gdrive = "gdrive.__main__:main"
