@@ -30,7 +30,7 @@ do_build() {
     local impl="${1:-nodejs}"
     set_impl_vars "$impl"
     echo "Building ${IMAGE_NAME}..."
-    "${CONTAINER_CMD}" build -f "${DOCKERFILE}" -t "${IMAGE_NAME}:latest" .
+    "${CONTAINER_CMD}" build --label "org.opencontainers.image.ref.name=$IMAGE_NAME:latest" -f "${DOCKERFILE}" -t "${IMAGE_NAME}:latest" .
 }
 
 do_run() {
