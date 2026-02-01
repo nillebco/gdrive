@@ -1520,6 +1520,11 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                         from urllib.parse import quote
                         # Never put client_id/client_secret in the redirect URL (security)
                         token_safe = {k: v for k, v in token_full.items() if k not in ('client_id', 'client_secret')}
+                        # Include user email so the MCP does not need to call userinfo (avoids scope/valid issues)
+                        account_email = _fetch_user_email(creds.token)
+                        if account_email:
+                            token_safe["email"] = account_email
+                            token_safe["account_email"] = account_email
                         token_param = quote(json.dumps(token_safe))
                         callback_url = f"{session['callback']}?token={token_param}"
                         del pending_sessions[state]
