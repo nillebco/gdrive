@@ -3,9 +3,11 @@
 import pytest
 
 from main import (
+    CREDENTIALS_ENV_VAR,
     _detect_credentials_type,
     _get_oauth_client_config,
     _parse_credentials_json,
+    get_credentials,
 )
 
 
@@ -81,3 +83,10 @@ def test_get_oauth_client_config_none() -> None:
 def test_detect_credentials_type_web() -> None:
     """Web application credentials are detected as client_secret (for token server)."""
     assert _detect_credentials_type({"web": {"client_id": "x", "client_secret": "y"}}) == "client_secret"
+
+
+def test_get_credentials_no_source_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """get_credentials raises FileNotFoundError when no env var and no file path."""
+    monkeypatch.delenv(CREDENTIALS_ENV_VAR, raising=False)
+    with pytest.raises(FileNotFoundError, match="Credentials required"):
+        get_credentials(fpath=None, token_path=None)

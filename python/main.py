@@ -348,11 +348,15 @@ def get_credentials(
     credentials_json = os.environ.get(CREDENTIALS_ENV_VAR)
     if credentials_json:
         return _get_credentials_from_dict(_parse_credentials_json(credentials_json), token_path)
-    
+
     # Fall back to file path
     if fpath is None:
-        fpath = "service_account.json"
-    
+        raise FileNotFoundError(
+            "Credentials required: set GOOGLE_CREDENTIALS (e.g. via Bitwarden) or pass --credentials-fpath / -c"
+        )
+    if not os.path.isfile(fpath):
+        raise FileNotFoundError(f"Credentials file not found: {fpath}")
+
     with open(fpath, "r") as f:
         data = json.load(f)
     return _get_credentials_from_dict(data, token_path)
