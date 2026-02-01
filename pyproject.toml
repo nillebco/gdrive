@@ -1,6 +1,6 @@
 [project]
 name = "gdrive"
-version = "0.1.0"
+version = "0.1.1"
 description = "CLI tool for Google Drive file operations"
 requires-python = ">=3.14"
 dependencies = [
@@ -18,4 +18,4 @@ dev = [
 ]
 
 [project.scripts]
-gdrive = "gdrive.__main__:main"
+gdrive = "gdrive.__main__:app"
