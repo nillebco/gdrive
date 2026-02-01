@@ -44,4 +44,4 @@ EXPOSE ${PORT}
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT}/health || exit 1
 
-CMD ["python", "main.py", "server", "--port", "8000"]
+CMD ["sh", "-c", "python main.py server --port $PORT"]
