@@ -21,7 +21,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from pydantic import BaseModel
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
 
 CREDENTIALS_ENV_VAR = "GOOGLE_CREDENTIALS"
 TOKEN_ENV_VAR = "GOOGLE_TOKEN"
@@ -1526,7 +1529,8 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                             token_safe["email"] = account_email
                             token_safe["account_email"] = account_email
                         token_param = quote(json.dumps(token_safe))
-                        callback_url = f"{session['callback']}?token={token_param}"
+                        # Echo state so the MCP can resolve the bound mcp_session_id and store credentials for the right session
+                        callback_url = f"{session['callback']}?token={token_param}&state={quote(state)}"
                         del pending_sessions[state]
                         self._send_redirect(callback_url)
                         return
