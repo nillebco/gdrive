@@ -43,7 +43,7 @@ do_run() {
         --name gdrive \
         --restart=always \
         -p 8080:8080 \
-        -e GOOGLE_CREDENTIALS="${GOOGLE_CREDENTIALS}" \
+        --env-file .env \
         "${IMAGE_NAME}:latest"
     echo "Container 'gdrive' started successfully."
 }

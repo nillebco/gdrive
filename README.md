@@ -612,6 +612,8 @@ Share an uploaded file with one or more email addresses.
 | `GOOGLE_TOKEN` | JSON content of the OAuth token (alternative to `token.json` file) |
 | `GDRIVE_TOKEN_SERVER` | URL of token server for authentication (alternative to `--token-server` option) |
 
+**Docker:** When running the app in Docker, pass credentials via `--env-file .env` so the JSON is not broken by the shell. In your `.env` file use raw JSON (no quotes around the value), e.g. `GOOGLE_CREDENTIALS={"installed":{"client_id":"..."}}`.
+
 ## Token File
 
 The OAuth token is stored in `token.json` with the following structure:

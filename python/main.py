@@ -300,6 +300,26 @@ def _get_credentials_from_dict(
         raise ValueError(f"Invalid credentials type: {credentials_type}")
 
 
+def _parse_credentials_json(credentials_json: str) -> dict:
+    """Parse GOOGLE_CREDENTIALS JSON string; raise a clear error on failure."""
+    stripped = credentials_json.strip()
+    if not stripped:
+        raise ValueError(
+            f"{CREDENTIALS_ENV_VAR} is set but empty. "
+            "Use a .env file with Docker (--env-file .env) or set the variable to valid JSON."
+        )
+    # Env files often use single quotes around JSON; Docker passes them literally.
+    if len(stripped) >= 2 and stripped[0] == "'" and stripped[-1] == "'":
+        stripped = stripped[1:-1]
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"{CREDENTIALS_ENV_VAR} is not valid JSON (parse error: {e}). "
+            "In .env, use raw JSON: GOOGLE_CREDENTIALS={\"installed\":...} without wrapping in quotes."
+        ) from e
+
+
 def get_credentials(
     fpath: Optional[str] = None, token_path: Optional[str] = None
 ) -> OAuthCredentials | ServiceAccountCredentials:
@@ -307,7 +327,7 @@ def get_credentials(
     # First, check environment variable
     credentials_json = os.environ.get(CREDENTIALS_ENV_VAR)
     if credentials_json:
-        return _get_credentials_from_dict(json.loads(credentials_json), token_path)
+        return _get_credentials_from_dict(_parse_credentials_json(credentials_json), token_path)
     
     # Fall back to file path
     if fpath is None:
