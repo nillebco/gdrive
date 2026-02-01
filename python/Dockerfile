@@ -1,37 +1,47 @@
-# Build from project root: podman build -f python/Dockerfile -t gdrive-python .
-FROM ghcr.io/astral-sh/uv:python3.14-alpine
-
-ARG PORT=8000
+# ---------- BUILDER ----------
+FROM ghcr.io/astral-sh/uv:python3.14-alpine AS builder
 
 WORKDIR /app
 
-# Copy dependency files
+# Install build deps only in builder
+RUN apk add --no-cache build-base
+
 COPY python/pyproject.toml python/uv.lock ./
 
-# Install dependencies
+# Create project venv in /app/.venv
 RUN uv sync --frozen --no-dev
 
-# Copy application code
 COPY python/main.py ./
 
-# Copy web files for static serving
+
+# ---------- RUNTIME ----------
+FROM python:3.14-alpine
+
+ARG PORT=8000
+ENV PORT=${PORT}
+
+WORKDIR /app
+
+# Copy virtual environment from builder
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/main.py ./
+
+# Static files
 COPY web /srv/web
 
-# Create non-root user for security (using high UID/GID to avoid conflicts)
+# Create non-root user with home
 RUN addgroup -g 10000 gdrive && \
     adduser -u 10000 -G gdrive -s /bin/sh -D -h /home/gdrive gdrive && \
-    mkdir -p /home/gdrive/.cache/uv && \
-    chown -R gdrive:gdrive /home/gdrive /app /srv/web
+    chown -R gdrive:gdrive /app /srv/web /home/gdrive
 
 USER gdrive
 
-ENV HOME=/home/gdrive
-ENV PORT=${PORT}
+# Use venv Python directly
+ENV PATH="/app/.venv/bin:$PATH"
+
 EXPOSE ${PORT}
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://localhost:${PORT}/health || exit 1
 
-# Start the token server
-CMD ["sh", "-c", "uv run --no-cache python main.py server --port $PORT"]
+CMD ["python", "main.py", "server", "--port", "8000"]
