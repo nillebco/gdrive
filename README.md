@@ -7,6 +7,12 @@ Available in both Python and Node.js implementations.
 ## Quick Start
 
 ```bash
+# using uvx (no clone required)
+uvx --from git+https://github.com/nillebco/gdrive@python gdrive --help
+
+# for all the following commands, assume
+# ./cli == uvx --from git+https://github.com/nillebco/gdrive@python gdrive
+
 # Login to Google (first time setup)
 ./cli login
 
