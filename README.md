@@ -774,11 +774,43 @@ The server accepts **Web application** or **Desktop (installed)** OAuth credenti
 
 3. **Share the URL** with your users (e.g., `http://your-server:8080`)
 
+### Token Refresh
+
+The token server provides a `/auth/refresh` endpoint that allows clients to refresh their access tokens without storing client credentials. This is automatically used by the CLI when tokens expire.
+
+**Endpoint:** `POST /auth/refresh`
+
+**Request:**
+```json
+{
+  "refresh_token": "1//..."
+}
+```
+
+**Response (success):**
+```json
+{
+  "token": "ya29...",
+  "expiry": "2026-02-02T13:00:00Z"
+}
+```
+
+**Response (error):**
+```json
+{
+  "error": "Failed to refresh token: invalid_grant"
+}
+```
+
+The CLI automatically refreshes tokens when they expire if you're using a token server. You don't need to manually call this endpoint.
+
 ### Security Considerations
 
 - The token server only generates OAuth tokens; it doesn't store them
 - Each user gets their own token linked to their Google account
 - Users can revoke access at any time in their [Google Account settings](https://myaccount.google.com/permissions)
+- Client credentials (client_id and client_secret) never leave the server
+- Tokens are automatically refreshed via the server without exposing credentials
 - Consider running behind HTTPS in production
 - The server doesn't require any database or persistent storage
 
