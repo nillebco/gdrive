@@ -476,9 +476,10 @@ function getOAuthClientConfig(credentials) {
  * Get OAuth credentials from client secret config.
  * @param {object} data - Client secret config (has 'installed' or 'web' key)
  * @param {string|null} tokenPath - Optional path to token file
+ * @param {string|null} tokenServer - Optional token server URL for server-side refresh
  * @returns {Promise<google.auth.OAuth2>} Authenticated OAuth2 client
  */
-async function getCredentialsClientSecretFromDict(data, tokenPath = null) {
+async function getCredentialsClientSecretFromDict(data, tokenPath = null, tokenServer = null) {
   const clientConfig = getOAuthClientConfig(data);
   const { client_id, client_secret, redirect_uris } = clientConfig || {};
 
@@ -498,10 +499,21 @@ async function getCredentialsClientSecretFromDict(data, tokenPath = null) {
     if (tokenData.expiry_date && Date.now() >= tokenData.expiry_date) {
       if (tokenData.refresh_token) {
         try {
-          const { credentials } = await oauth2Client.refreshAccessToken();
-          // Preserve the account email from the old token
-          saveToken(credentials, tokenPath, tokenData.account_email);
-          return oauth2Client;
+          // If using token server, refresh via server
+          if (tokenServer) {
+            const refreshedToken = await refreshTokenViaServer(tokenPath, tokenServer);
+            if (refreshedToken) {
+              oauth2Client.setCredentials(refreshedToken);
+              return oauth2Client;
+            }
+            // If server refresh failed, fall through to OAuth flow
+          } else {
+            // Use local client credentials to refresh
+            const { credentials } = await oauth2Client.refreshAccessToken();
+            // Preserve the account email from the old token
+            saveToken(credentials, tokenPath, tokenData.account_email);
+            return oauth2Client;
+          }
         } catch {
           // Fall through to new OAuth flow
         }
@@ -544,15 +556,16 @@ function detectCredentialsType(data) {
  * Get credentials from a config object.
  * @param {object} data - Credentials config
  * @param {string|null} tokenPath - Optional path to token file
+ * @param {string|null} tokenServer - Optional token server URL for server-side refresh
  * @returns {Promise<google.auth.OAuth2|google.auth.JWT>} Auth client
  */
-async function getCredentialsFromDict(data, tokenPath = null) {
+async function getCredentialsFromDict(data, tokenPath = null, tokenServer = null) {
   const credentialsType = detectCredentialsType(data);
 
   if (credentialsType === 'service_account') {
     return getCredentialsServiceAccountFromDict(data);
   } else if (credentialsType === 'client_secret') {
-    return getCredentialsClientSecretFromDict(data, tokenPath);
+    return getCredentialsClientSecretFromDict(data, tokenPath, tokenServer);
   } else {
     throw new Error(`Invalid credentials type: ${credentialsType}`);
   }
@@ -562,13 +575,14 @@ async function getCredentialsFromDict(data, tokenPath = null) {
  * Get credentials from file path or environment variable.
  * @param {string|null} fpath - Optional path to credentials file
  * @param {string|null} tokenPath - Optional path to token file
+ * @param {string|null} tokenServer - Optional token server URL for server-side refresh
  * @returns {Promise<google.auth.OAuth2|google.auth.JWT>} Auth client
  */
-async function getCredentials(fpath = null, tokenPath = null) {
+async function getCredentials(fpath = null, tokenPath = null, tokenServer = null) {
   // First, check environment variable
   const credentialsJson = process.env[CREDENTIALS_ENV_VAR];
   if (credentialsJson) {
-    return getCredentialsFromDict(JSON.parse(credentialsJson), tokenPath);
+    return getCredentialsFromDict(JSON.parse(credentialsJson), tokenPath, tokenServer);
   }
 
   // Fall back to file path
@@ -579,7 +593,7 @@ async function getCredentials(fpath = null, tokenPath = null) {
   }
 
   const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  return getCredentialsFromDict(data, tokenPath);
+  return getCredentialsFromDict(data, tokenPath, tokenServer);
 }
 
 /**
@@ -593,10 +607,12 @@ async function getCredentials(fpath = null, tokenPath = null) {
  * @param {boolean} overwrite - Skip upstream modification check
  * @param {string|null} folderId - Parent folder ID (can be a shared drive ID or folder within)
  * @param {string|null} driveId - Shared drive ID (for tracking in mapping)
+ * @param {string|null} tokenServer - Token server URL for server-side token refresh
  * @returns {Promise<object>} Uploaded file metadata
  */
-async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = null, credentialsFpath = null, tokenPath = null, mappingPath = null, overwrite = false, folderId = null, driveId = null) {
-  const auth = await getCredentials(credentialsFpath, tokenPath);
+async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = null, credentialsFpath = null, tokenPath = null, mappingPath = null, overwrite = false, folderId = null, driveId = null, tokenServer = null) {
+  const serverUrl = getTokenServer(tokenServer);
+  const auth = await getCredentials(credentialsFpath, tokenPath, serverUrl);
   const drive = google.drive({ version: 'v3', auth });
 
   // Determine source MIME type
@@ -715,10 +731,12 @@ async function uploadFile(fpath, sourceMimetype = null, destinationMimetype = nu
  * @param {string|null} tokenPath - Path to token file
  * @param {string|null} mappingPath - Path to files mapping file
  * @param {string|null} driveId - Shared drive ID (for tracking in mapping)
+ * @param {string|null} tokenServer - Token server URL for server-side token refresh
  * @returns {Promise<string>} Output path
  */
-async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFpath = null, tokenPath = null, mappingPath = null, driveId = null) {
-  const auth = await getCredentials(credentialsFpath, tokenPath);
+async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFpath = null, tokenPath = null, mappingPath = null, driveId = null, tokenServer = null) {
+  const serverUrl = getTokenServer(tokenServer);
+  const auth = await getCredentials(credentialsFpath, tokenPath, serverUrl);
   const drive = google.drive({ version: 'v3', auth });
 
   // Get the MIME type for the export format
@@ -761,16 +779,18 @@ async function exportFile(fileId, outputPath, exportFormat = 'md', credentialsFp
  * @param {string|null} credentialsFpath - Path to credentials file
  * @param {string|null} tokenPath - Path to token file
  * @param {string|null} mappingPath - Path to files mapping file
+ * @param {string|null} tokenServer - Token server URL for server-side token refresh
  * @returns {Promise<string[]>} Array of paths to re-exported files
  */
-async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = null) {
+async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = null, tokenServer = null) {
   const mapping = loadMapping(mappingPath);
   
   if (!mapping.exports || Object.keys(mapping.exports).length === 0) {
     return [];
   }
   
-  const auth = await getCredentials(credentialsFpath, tokenPath);
+  const serverUrl = getTokenServer(tokenServer);
+  const auth = await getCredentials(credentialsFpath, tokenPath, serverUrl);
   const drive = google.drive({ version: 'v3', auth });
   
   const results = [];
@@ -830,16 +850,18 @@ async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = 
  * @param {string|null} tokenPath - Path to token file
  * @param {string|null} mappingPath - Path to files mapping file
  * @param {boolean} overwrite - Skip upstream modification check
+ * @param {string|null} tokenServer - Token server URL for server-side token refresh
  * @returns {Promise<string[]>} Array of paths to re-uploaded files
  */
-async function pushAll(credentialsFpath = null, tokenPath = null, mappingPath = null, overwrite = false) {
+async function pushAll(credentialsFpath = null, tokenPath = null, mappingPath = null, overwrite = false, tokenServer = null) {
   const mapping = loadMapping(mappingPath);
   
   if (!mapping.uploads || Object.keys(mapping.uploads).length === 0) {
     return [];
   }
   
-  const auth = await getCredentials(credentialsFpath, tokenPath);
+  const serverUrl = getTokenServer(tokenServer);
+  const auth = await getCredentials(credentialsFpath, tokenPath, serverUrl);
   const drive = google.drive({ version: 'v3', auth });
   
   const results = [];
@@ -929,9 +951,10 @@ async function pushAll(credentialsFpath = null, tokenPath = null, mappingPath = 
  * @param {string|null} credentialsFpath - Path to credentials file
  * @param {string|null} tokenPath - Path to token file
  * @param {string|null} mappingPath - Path to files mapping file
+ * @param {string|null} tokenServer - Token server URL for server-side token refresh
  * @returns {Promise<object[]>} Array of created permission metadata
  */
-async function shareFile(fpath, emails, role = 'reader', notify = true, credentialsFpath = null, tokenPath = null, mappingPath = null) {
+async function shareFile(fpath, emails, role = 'reader', notify = true, credentialsFpath = null, tokenPath = null, mappingPath = null, tokenServer = null) {
   // Load mapping and resolve file path to Drive ID
   const mapping = loadMapping(mappingPath);
   const absPath = getAbsolutePath(fpath);
@@ -943,7 +966,8 @@ async function shareFile(fpath, emails, role = 'reader', notify = true, credenti
   
   const fileId = existingRecord.drive_file_id;
   
-  const auth = await getCredentials(credentialsFpath, tokenPath);
+  const serverUrl = getTokenServer(tokenServer);
+  const auth = await getCredentials(credentialsFpath, tokenPath, serverUrl);
   const drive = google.drive({ version: 'v3', auth });
   
   // Parse comma-separated email addresses
@@ -1010,7 +1034,7 @@ program
       // Resolve drive name to ID if provided
       let driveId = options.driveId;
       if (options.driveName && !driveId) {
-        const auth = await getCredentials(options.credentialsFpath, options.tokenPath);
+        const auth = await getCredentials(options.credentialsFpath, options.tokenPath, serverUrl);
         const drive = google.drive({ version: 'v3', auth });
         driveId = await resolveDriveId(drive, options.driveName);
       }
@@ -1030,7 +1054,8 @@ program
         options.mappingPath,
         options.overwrite || false,
         folderId,
-        driveId
+        driveId,
+        serverUrl
       );
       console.log(file.id);
     } catch (error) {
@@ -1063,7 +1088,7 @@ program
       // Resolve drive name to ID if provided
       let driveId = options.driveId;
       if (options.driveName && !driveId) {
-        const auth = await getCredentials(options.credentialsFpath, options.tokenPath);
+        const auth = await getCredentials(options.credentialsFpath, options.tokenPath, serverUrl);
         const drive = google.drive({ version: 'v3', auth });
         driveId = await resolveDriveId(drive, options.driveName);
       }
@@ -1075,7 +1100,8 @@ program
         options.credentialsFpath,
         options.tokenPath,
         options.mappingPath,
-        driveId
+        driveId,
+        serverUrl
       );
       console.log(`Exported to: ${result}`);
     } catch (error) {
@@ -1117,7 +1143,8 @@ program
         options.notify,
         options.credentialsFpath,
         options.tokenPath,
-        options.mappingPath
+        options.mappingPath,
+        serverUrl
       );
       
       for (const permission of permissions) {
@@ -1147,7 +1174,8 @@ program
       const results = await pullAll(
         options.credentialsFpath,
         options.tokenPath,
-        options.mappingPath
+        options.mappingPath,
+        serverUrl
       );
       if (results.length === 0) {
         console.log('No previously exported documents found.');
@@ -1183,7 +1211,8 @@ program
         options.credentialsFpath,
         options.tokenPath,
         options.mappingPath,
-        options.overwrite || false
+        options.overwrite || false,
+        serverUrl
       );
       if (results.length === 0) {
         console.log('No previously uploaded files found.');
@@ -1221,7 +1250,8 @@ program
       const pullResults = await pullAll(
         options.credentialsFpath,
         options.tokenPath,
-        options.mappingPath
+        options.mappingPath,
+        serverUrl
       );
       if (pullResults.length === 0) {
         console.log('No previously exported documents found.');
@@ -1238,7 +1268,8 @@ program
         options.credentialsFpath,
         options.tokenPath,
         options.mappingPath,
-        options.overwrite || false
+        options.overwrite || false,
+        serverUrl
       );
       if (pushResults.length === 0) {
         console.log('No previously uploaded files found.');
@@ -1274,7 +1305,7 @@ program
       if (serverUrl) {
         await fetchTokenFromServer(serverUrl, options.tokenPath);
       }
-      const auth = await getCredentials(options.credentialsFpath, options.tokenPath);
+      const auth = await getCredentials(options.credentialsFpath, options.tokenPath, serverUrl);
       const drive = google.drive({ version: 'v3', auth });
 
       const params = {
@@ -1797,6 +1828,80 @@ function escapeHtml(str) {
 }
 
 /**
+ * Refresh an access token using the token server.
+ * @param {string} serverUrl - URL of the token server
+ * @param {string} refreshToken - The refresh token to use
+ * @returns {Promise<object|null>} Object with 'token' and 'expiry', or null if refresh failed
+ */
+async function refreshTokenFromServer(serverUrl, refreshToken) {
+  const refreshUrl = `${serverUrl.replace(/\/$/, '')}/auth/refresh`;
+  
+  try {
+    const response = await fetch(refreshUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ refresh_token: refreshToken }),
+    });
+    
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      console.error('Token refresh failed:', errorData.error || `HTTP ${response.status}`);
+      return null;
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error('Token refresh failed:', error.message);
+    return null;
+  }
+}
+
+/**
+ * Refresh token via server and update token file.
+ * @param {string} tokenPath - Path to token file
+ * @param {string} serverUrl - Token server URL
+ * @returns {Promise<object|null>} Refreshed token data or null if refresh failed
+ */
+async function refreshTokenViaServer(tokenPath, serverUrl) {
+  // Load current token to get refresh_token
+  const filePath = tokenPath || DEFAULT_TOKEN_PATH;
+  if (!fs.existsSync(filePath)) {
+    return null;
+  }
+  
+  try {
+    const tokenData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const refreshToken = tokenData.refresh_token;
+    
+    if (!refreshToken) {
+      return null;
+    }
+    
+    // Call server to refresh
+    const result = await refreshTokenFromServer(serverUrl, refreshToken);
+    if (!result) {
+      return null;
+    }
+    
+    // Update token data with new access token
+    tokenData.access_token = result.token;
+    if (result.expiry) {
+      tokenData.expiry_date = new Date(result.expiry).getTime();
+    }
+    
+    // Save updated token
+    fs.writeFileSync(filePath, JSON.stringify(tokenData, null, 2));
+    
+    return tokenData;
+  } catch (error) {
+    console.error('Failed to refresh token via server:', error.message);
+    return null;
+  }
+}
+
+/**
  * Fetch token from a token server.
  * @param {string} serverUrl - URL of the token server
  * @param {string|null} tokenPath - Path to save the token
@@ -1975,8 +2080,10 @@ async function startTokenServer(port, credentialsFpath = null) {
           // Check if there's a CLI callback waiting
           const session = pendingSessions.get(state);
           if (session?.callback) {
+            // Filter out any potential credential fields before sending (defensive)
+            const { client_id, client_secret, ...safeTokens } = tokens;
             // Redirect to CLI's local server with the token
-            const tokenParam = encodeURIComponent(JSON.stringify(tokens));
+            const tokenParam = encodeURIComponent(JSON.stringify(safeTokens));
             const callbackUrl = `${session.callback}?token=${tokenParam}`;
             pendingSessions.delete(state);
             
@@ -1987,12 +2094,63 @@ async function startTokenServer(port, credentialsFpath = null) {
           
           // No CLI callback, show the success page with token
           pendingSessions.delete(state);
+          // Filter out any potential credential fields before displaying (defensive)
+          const { client_id, client_secret, ...safeTokens } = tokens;
           res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(generateSuccessPage(tokens, state));
+          res.end(generateSuccessPage(safeTokens, state));
         } catch (err) {
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end(generateLandingPage(baseUrl, `Failed to exchange code for token: ${err.message}`));
         }
+        return;
+      }
+
+      // Token refresh endpoint
+      if (req.method === 'POST' && url.pathname === '/auth/refresh') {
+        let body = '';
+        
+        req.on('data', chunk => {
+          body += chunk.toString();
+        });
+        
+        req.on('end', async () => {
+          try {
+            // Parse request body
+            if (!body) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Missing request body' }));
+              return;
+            }
+            
+            const data = JSON.parse(body);
+            const refreshToken = data.refresh_token;
+            
+            if (!refreshToken) {
+              res.writeHead(400, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'Missing refresh_token in request body' }));
+              return;
+            }
+            
+            // Use server's client credentials to refresh the token
+            const oauth2Client = new google.auth.OAuth2(client_id, client_secret);
+            oauth2Client.setCredentials({ refresh_token: refreshToken });
+            
+            const { credentials: newCredentials } = await oauth2Client.refreshAccessToken();
+            
+            // Return new access token
+            const response = {
+              token: newCredentials.access_token,
+              expiry: newCredentials.expiry_date ? new Date(newCredentials.expiry_date).toISOString() : null,
+            };
+            
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(response));
+          } catch (err) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Failed to refresh token: ${err.message}` }));
+          }
+        });
+        
         return;
       }
 
@@ -2183,6 +2341,8 @@ export {
   resolveMimetype,
   startTokenServer,
   fetchTokenFromServer,
+  refreshTokenFromServer,
+  refreshTokenViaServer,
   SCOPES,
   MIME_TYPES,
   EXPORT_MIME_TYPES,

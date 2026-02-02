@@ -140,14 +140,16 @@ def _get_absolute_path(fpath: str) -> str:
 def _load_token(
     token_path: Optional[str] = None,
     client_id: Optional[str] = None,
-    client_secret: Optional[str] = None
+    client_secret: Optional[str] = None,
+    token_server: Optional[str] = None,
 ) -> Optional[OAuthCredentials]:
     """Load saved OAuth token from file or environment variable.
 
     Args:
         token_path: Path to token.json file
-        client_id: OAuth client ID (required for token refresh)
-        client_secret: OAuth client secret (required for token refresh)
+        client_id: OAuth client ID (required for token refresh without server)
+        client_secret: OAuth client secret (required for token refresh without server)
+        token_server: Token server URL (for server-side refresh)
     """
     token_data = None
 
@@ -164,6 +166,20 @@ def _load_token(
 
     if token_data is None:
         return None
+
+    # If using token server, we don't need client credentials
+    if token_server:
+        # For token server tokens, we just need the access token to be valid
+        # Refresh will be handled separately via _refresh_token_via_server
+        try:
+            # Build minimal credentials object (without client_id/client_secret)
+            return OAuthCredentials.from_authorized_user_info(
+                {**token_data, 'client_id': 'placeholder', 'client_secret': 'placeholder'},
+                SCOPES
+            )
+        except Exception as ex:
+            print("exception caught", ex)
+            return None
 
     # Inject client_id and client_secret if not present (required by the library)
     if client_id and "client_id" not in token_data:
@@ -256,8 +272,57 @@ def _get_client_credentials(credentials_path: Optional[str] = None) -> tuple[Opt
     return None, None
 
 
+def _refresh_token_via_server(
+    token_path: Optional[str],
+    token_server: str,
+) -> Optional[OAuthCredentials]:
+    """Refresh token using the token server.
+    
+    Args:
+        token_path: Path to token file
+        token_server: Token server URL
+        
+    Returns:
+        Refreshed credentials or None if refresh failed
+    """
+    # Load current token to get refresh_token
+    path = token_path or DEFAULT_TOKEN_PATH
+    if not os.path.exists(path):
+        return None
+    
+    with open(path, "r") as f:
+        token_data = json.load(f)
+    
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        return None
+    
+    # Call server to refresh
+    result = _refresh_token_from_server(token_server, refresh_token)
+    if not result:
+        return None
+    
+    # Update token data with new access token
+    token_data["token"] = result["token"]
+    if result.get("expiry"):
+        token_data["expiry"] = result["expiry"]
+    
+    # Save updated token
+    with open(path, "w") as f:
+        json.dump(token_data, f, indent=2)
+    
+    # Return credentials object
+    try:
+        return OAuthCredentials.from_authorized_user_info(
+            {**token_data, 'client_id': 'placeholder', 'client_secret': 'placeholder'},
+            SCOPES
+        )
+    except Exception:
+        return None
+
+
 def _get_credentials_client_secret_from_dict(
-    data: dict, token_path: Optional[str] = None
+    data: dict, token_path: Optional[str] = None, token_server: Optional[str] = None
 ) -> OAuthCredentials:
     """Get OAuth credentials, using cached token if available."""
     # Extract client_id and client_secret from Desktop (installed) or Web credentials
@@ -266,7 +331,7 @@ def _get_credentials_client_secret_from_dict(
     client_secret = client_config.get("client_secret")
 
     # Try to load existing token (inject client creds for refresh capability)
-    creds = _load_token(token_path, client_id=client_id, client_secret=client_secret)
+    creds = _load_token(token_path, client_id=client_id, client_secret=client_secret, token_server=token_server)
 
     if creds and creds.valid:
         return creds
@@ -274,11 +339,18 @@ def _get_credentials_client_secret_from_dict(
     # Try to refresh expired token
     if creds and creds.expired and creds.refresh_token:
         try:
-            # Preserve existing account email
-            existing_email = _get_stored_account_email(token_path)
-            creds.refresh(Request())
-            _save_token(creds, token_path, existing_email)
-            return creds
+            # If using token server, refresh via server
+            if token_server:
+                refreshed_creds = _refresh_token_via_server(token_path, token_server)
+                if refreshed_creds:
+                    return refreshed_creds
+                # If server refresh failed, fall through to OAuth flow
+            else:
+                # Preserve existing account email
+                existing_email = _get_stored_account_email(token_path)
+                creds.refresh(Request())
+                _save_token(creds, token_path, existing_email)
+                return creds
         except Exception:
             pass  # Fall through to new OAuth flow
 
@@ -308,14 +380,14 @@ def _detect_credentials_type(data: dict) -> str:
 
 
 def _get_credentials_from_dict(
-    data: dict, token_path: Optional[str] = None
+    data: dict, token_path: Optional[str] = None, token_server: Optional[str] = None
 ) -> OAuthCredentials | ServiceAccountCredentials:
     """Get credentials from a dict."""
     credentials_type = _detect_credentials_type(data)
     if credentials_type == "service_account":
         return _get_credentials_service_account_from_dict(data)
     elif credentials_type == "client_secret":
-        return _get_credentials_client_secret_from_dict(data, token_path)
+        return _get_credentials_client_secret_from_dict(data, token_path, token_server)
     else:
         raise ValueError(f"Invalid credentials type: {credentials_type}")
 
@@ -341,13 +413,19 @@ def _parse_credentials_json(credentials_json: str) -> dict:
 
 
 def get_credentials(
-    fpath: Optional[str] = None, token_path: Optional[str] = None
+    fpath: Optional[str] = None, token_path: Optional[str] = None, token_server: Optional[str] = None
 ) -> OAuthCredentials | ServiceAccountCredentials:
-    """Get credentials from file path or GOOGLE_CREDENTIALS environment variable."""
+    """Get credentials from file path or GOOGLE_CREDENTIALS environment variable.
+    
+    Args:
+        fpath: Path to credentials file
+        token_path: Path to token file
+        token_server: Token server URL (for server-side token refresh)
+    """
     # First, check environment variable
     credentials_json = os.environ.get(CREDENTIALS_ENV_VAR)
     if credentials_json:
-        return _get_credentials_from_dict(_parse_credentials_json(credentials_json), token_path)
+        return _get_credentials_from_dict(_parse_credentials_json(credentials_json), token_path, token_server)
 
     # Fall back to file path
     if fpath is None:
@@ -359,7 +437,7 @@ def get_credentials(
 
     with open(fpath, "r") as f:
         data = json.load(f)
-    return _get_credentials_from_dict(data, token_path)
+    return _get_credentials_from_dict(data, token_path, token_server)
 
 
 MIME_TYPES = {
@@ -499,6 +577,7 @@ def upload_file(
     overwrite: bool = False,
     folder_id: Optional[str] = None,
     drive_id: Optional[str] = None,
+    token_server: Optional[str] = None,
 ):
     """Upload a file to Google Drive (supports shared drives).
 
@@ -512,8 +591,10 @@ def upload_file(
         overwrite: Skip upstream modification check
         folder_id: Parent folder ID (can be a shared drive root or folder within)
         drive_id: Shared drive ID (for tracking in mapping)
+        token_server: Token server URL (for server-side token refresh)
     """
-    creds = get_credentials(credentials_fpath, token_path)
+    server_url = _get_token_server(token_server)
+    creds = get_credentials(credentials_fpath, token_path, server_url)
     drive = build("drive", "v3", credentials=creds)
     if source_mimetype is None:
         source_mimetype = MIME_TYPES.get(fpath.split(".")[-1])
@@ -620,6 +701,7 @@ def export_file(
     token_path: Optional[str] = None,
     mapping_path: Optional[str] = None,
     drive_id: Optional[str] = None,
+    token_server: Optional[str] = None,
 ) -> str:
     """Export a Google Workspace document to the specified format (supports shared drives).
 
@@ -631,8 +713,10 @@ def export_file(
         token_path: Path to token file
         mapping_path: Path to files mapping file
         drive_id: Shared drive ID (for tracking in mapping)
+        token_server: Token server URL (for server-side token refresh)
     """
-    creds = get_credentials(credentials_fpath, token_path)
+    server_url = _get_token_server(token_server)
+    creds = get_credentials(credentials_fpath, token_path, server_url)
     drive = build("drive", "v3", credentials=creds)
 
     # Get the MIME type for the export format
@@ -683,6 +767,7 @@ def pull_all(
     credentials_fpath: Optional[str] = None,
     token_path: Optional[str] = None,
     mapping_path: Optional[str] = None,
+    token_server: Optional[str] = None,
 ) -> list[str]:
     """Re-export all documents that have been previously exported.
     
@@ -690,6 +775,7 @@ def pull_all(
         credentials_fpath: Path to credentials file
         token_path: Path to token file
         mapping_path: Path to files mapping file
+        token_server: Token server URL (for server-side token refresh)
     
     Returns:
         List of paths to the re-exported files
@@ -699,7 +785,8 @@ def pull_all(
     if not mapping.exports:
         return []
     
-    creds = get_credentials(credentials_fpath, token_path)
+    server_url = _get_token_server(token_server)
+    creds = get_credentials(credentials_fpath, token_path, server_url)
     drive = build("drive", "v3", credentials=creds)
     
     results = []
@@ -757,6 +844,7 @@ def push_all(
     token_path: Optional[str] = None,
     mapping_path: Optional[str] = None,
     overwrite: bool = False,
+    token_server: Optional[str] = None,
 ) -> list[str]:
     """Re-upload all files that have been previously uploaded.
     
@@ -765,6 +853,7 @@ def push_all(
         token_path: Path to token file
         mapping_path: Path to files mapping file
         overwrite: Skip upstream modification check and overwrite without prompting
+        token_server: Token server URL (for server-side token refresh)
     
     Returns:
         List of paths to the re-uploaded files
@@ -774,7 +863,8 @@ def push_all(
     if not mapping.uploads:
         return []
     
-    creds = get_credentials(credentials_fpath, token_path)
+    server_url = _get_token_server(token_server)
+    creds = get_credentials(credentials_fpath, token_path, server_url)
     drive = build("drive", "v3", credentials=creds)
     
     results = []
@@ -823,7 +913,7 @@ def push_all(
             media = MediaFileUpload(local_path, mimetype=source_mimetype)
             
             # Update existing file
-            result = drive.files().update(
+            drive.files().update(
                 fileId=record.drive_file_id,
                 body=metadata,
                 media_body=media,
@@ -853,6 +943,7 @@ def share_file(
     credentials_fpath: Optional[str] = None,
     token_path: Optional[str] = None,
     mapping_path: Optional[str] = None,
+    token_server: Optional[str] = None,
 ) -> list[dict]:
     """Share a file on Google Drive with one or more email addresses.
     
@@ -864,6 +955,7 @@ def share_file(
         credentials_fpath: Path to credentials file
         token_path: Path to token file
         mapping_path: Path to files mapping file
+        token_server: Token server URL (for server-side token refresh)
     
     Returns:
         List of created permission metadata
@@ -881,7 +973,8 @@ def share_file(
     
     file_id = existing_record.drive_file_id
     
-    creds = get_credentials(credentials_fpath, token_path)
+    server_url = _get_token_server(token_server)
+    creds = get_credentials(credentials_fpath, token_path, server_url)
     drive = build("drive", "v3", credentials=creds)
     
     # Parse comma-separated email addresses
@@ -1316,14 +1409,62 @@ def _generate_success_page(token: dict, session_id: str) -> str:
 </html>'''
 
 
+def _refresh_token_from_server(server_url: str, refresh_token: str) -> Optional[dict]:
+    """Refresh an access token using the token server.
+    
+    Args:
+        server_url: URL of the token server
+        refresh_token: The refresh token to use
+        
+    Returns:
+        Dict with 'token' and 'expiry', or None if refresh failed
+    """
+    import urllib.request
+    import urllib.error
+    
+    refresh_url = f"{server_url.rstrip('/')}/auth/refresh"
+    
+    request_data = json.dumps({'refresh_token': refresh_token}).encode('utf-8')
+    
+    try:
+        req = urllib.request.Request(
+            refresh_url,
+            data=request_data,
+            headers={'Content-Type': 'application/json'},
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+            return result
+    except urllib.error.HTTPError as e:
+        # Read error response for debugging
+        try:
+            error_body = e.read().decode('utf-8')
+            error_data = json.loads(error_body)
+            print(f"Token refresh failed: {error_data.get('error', 'Unknown error')}")
+        except Exception:
+            print(f"Token refresh failed with HTTP {e.code} {repr(e)}")
+        return None
+    except Exception as e:
+        print(f"Token refresh failed: {e}")
+        return None
+
+
 def _fetch_token_from_server(server_url: str, token_path: Optional[str] = None) -> None:
     """Fetch token from a token server."""
     from urllib.parse import quote
     
     # Check if we already have a valid token
-    existing_token = _load_token(token_path)
+    existing_token = _load_token(token_path, token_server=server_url)
     if existing_token and existing_token.valid:
         return
+    
+    # If token exists but is expired, try to refresh via server
+    if existing_token and existing_token.expired and existing_token.refresh_token:
+        refreshed_creds = _refresh_token_via_server(token_path, server_url)
+        if refreshed_creds and refreshed_creds.valid:
+            return
     
     print(f"Opening browser to authenticate via {server_url}...")
     
@@ -1429,6 +1570,12 @@ class TokenServerHandler(BaseHTTPRequestHandler):
         self.send_response(302)
         self.send_header('Location', location)
         self.end_headers()
+    
+    def _send_json(self, data: dict, status: int = 200):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -1569,6 +1716,82 @@ class TokenServerHandler(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'text/plain')
             self.end_headers()
             self.wfile.write(f"Internal Server Error: {e}".encode())
+    
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        
+        try:
+            # Refresh token endpoint
+            if parsed.path == '/auth/refresh':
+                # Read request body
+                content_length = int(self.headers.get('Content-Length', 0))
+                if content_length == 0:
+                    self._send_json({'error': 'Missing request body'}, 400)
+                    return
+                
+                body = self.rfile.read(content_length)
+                try:
+                    data = json.loads(body.decode('utf-8'))
+                except json.JSONDecodeError:
+                    self._send_json({'error': 'Invalid JSON in request body'}, 400)
+                    return
+                
+                refresh_token = data.get('refresh_token')
+                if not refresh_token:
+                    self._send_json({'error': 'Missing refresh_token in request body'}, 400)
+                    return
+                
+                # Get client credentials from server config
+                creds_data = _get_oauth_client_config(self.credentials)
+                if not creds_data:
+                    self._send_json({'error': 'Server credentials not configured'}, 500)
+                    return
+                
+                client_id = creds_data.get('client_id')
+                client_secret = creds_data.get('client_secret')
+                
+                if not client_id or not client_secret:
+                    self._send_json({'error': 'Server credentials incomplete'}, 500)
+                    return
+                
+                # Create credentials object with the refresh token
+                token_data = {
+                    'refresh_token': refresh_token,
+                    'client_id': client_id,
+                    'client_secret': client_secret,
+                    'token_uri': 'https://oauth2.googleapis.com/token',
+                }
+                
+                try:
+                    creds = OAuthCredentials.from_authorized_user_info(token_data, SCOPES)
+                    # Refresh the token
+                    creds.refresh(Request())
+                    
+                    # Return new access token
+                    response = {
+                        'token': creds.token,
+                        'expiry': creds.expiry.isoformat() if creds.expiry else None,
+                    }
+                    self._send_json(response, 200)
+                    return
+                    
+                except Exception as e:
+                    self._send_json({'error': f'Failed to refresh token: {str(e)}'}, 401)
+                    return
+            
+            # 404 for other POST requests
+            self.send_response(404)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.send_response(500)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(f"Internal Server Error: {e}".encode())
 
 
 def start_token_server(port: int, credentials_fpath: Optional[str] = None):
@@ -1689,7 +1912,8 @@ def login(
 
     # Run OAuth flow
     try:
-        get_credentials(credentials_fpath, token_path)
+        server_url = _get_token_server(token_server)
+        get_credentials(credentials_fpath, token_path, server_url)
         path = token_path or DEFAULT_TOKEN_PATH
         print(f"Authentication successful. Token saved to {path}")
         account_email = _get_stored_account_email(token_path)
@@ -1738,7 +1962,8 @@ def whoami(
 
     # Try to fetch email from API using full credentials
     try:
-        creds = get_credentials(credentials_path, token_path)
+        # whoami doesn't need token_server since it's just reading the stored email
+        creds = get_credentials(credentials_path, token_path, None)
         if creds and hasattr(creds, 'token') and creds.token:
             email = _fetch_user_email(creds.token)
             if email:
@@ -1847,7 +2072,7 @@ def upload(
         # Resolve drive name to ID if provided
         resolved_drive_id = drive_id
         if drive_name and not resolved_drive_id:
-            creds = get_credentials(credentials_fpath, token_path)
+            creds = get_credentials(credentials_fpath, token_path, server_url)
             drive = build("drive", "v3", credentials=creds)
             resolved_drive_id = _resolve_drive_id(drive, drive_name)
 
@@ -1859,7 +2084,7 @@ def upload(
         resolved_dest = _resolve_mimetype(destination_mimetype)
         file = await asyncify(upload_file)(
             fpath, resolved_source, resolved_dest, credentials_fpath, token_path,
-            mapping_path, overwrite, resolved_folder_id, resolved_drive_id
+            mapping_path, overwrite, resolved_folder_id, resolved_drive_id, server_url
         )
         print(file["id"])
 
@@ -1944,12 +2169,12 @@ def export(
         # Resolve drive name to ID if provided
         resolved_drive_id = drive_id
         if drive_name and not resolved_drive_id:
-            creds = get_credentials(credentials_fpath, token_path)
+            creds = get_credentials(credentials_fpath, token_path, server_url)
             drive = build("drive", "v3", credentials=creds)
             resolved_drive_id = _resolve_drive_id(drive, drive_name)
 
         result = await asyncify(export_file)(
-            file_id, output_path, format, credentials_fpath, token_path, mapping_path, resolved_drive_id
+            file_id, output_path, format, credentials_fpath, token_path, mapping_path, resolved_drive_id, server_url
         )
         print(f"Exported to: {result}")
 
@@ -2031,7 +2256,7 @@ def share(
         server_url = _get_token_server(token_server)
         if server_url:
             _fetch_token_from_server(server_url, token_path)
-        results = await asyncify(share_file)(fpath, emails, role, notify, credentials_fpath, token_path, mapping_path)
+        results = await asyncify(share_file)(fpath, emails, role, notify, credentials_fpath, token_path, mapping_path, server_url)
         for result in results:
             print(f"Shared with {result['emailAddress']} as {result['role']}")
     
@@ -2087,7 +2312,7 @@ def pull(
         server_url = _get_token_server(token_server)
         if server_url:
             _fetch_token_from_server(server_url, token_path)
-        results = await asyncify(pull_all)(credentials_fpath, token_path, mapping_path)
+        results = await asyncify(pull_all)(credentials_fpath, token_path, mapping_path, server_url)
         if not results:
             print("No previously exported documents found.")
         else:
@@ -2154,7 +2379,7 @@ def push(
         server_url = _get_token_server(token_server)
         if server_url:
             _fetch_token_from_server(server_url, token_path)
-        results = await asyncify(push_all)(credentials_fpath, token_path, mapping_path, overwrite)
+        results = await asyncify(push_all)(credentials_fpath, token_path, mapping_path, overwrite, server_url)
         if not results:
             print("No previously uploaded files found.")
         else:
@@ -2225,7 +2450,7 @@ def sync(
 
         # First, pull (re-export all documents)
         print("--- Pull (re-exporting documents) ---")
-        pull_results = await asyncify(pull_all)(credentials_fpath, token_path, mapping_path)
+        pull_results = await asyncify(pull_all)(credentials_fpath, token_path, mapping_path, server_url)
         if not pull_results:
             print("No previously exported documents found.")
         else:
@@ -2235,7 +2460,7 @@ def sync(
 
         # Then, push (re-upload all files)
         print("--- Push (re-uploading files) ---")
-        push_results = await asyncify(push_all)(credentials_fpath, token_path, mapping_path, overwrite)
+        push_results = await asyncify(push_all)(credentials_fpath, token_path, mapping_path, overwrite, server_url)
         if not push_results:
             print("No previously uploaded files found.")
         else:
@@ -2296,7 +2521,7 @@ def list_drives(
     if server_url:
         _fetch_token_from_server(server_url, token_path)
 
-    creds = get_credentials(credentials_fpath, token_path)
+    creds = get_credentials(credentials_fpath, token_path, server_url)
     drive = build("drive", "v3", credentials=creds)
 
     all_drives = []
