@@ -21,7 +21,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from pydantic import BaseModel
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
 
 CREDENTIALS_ENV_VAR = "GOOGLE_CREDENTIALS"
 TOKEN_ENV_VAR = "GOOGLE_TOKEN"
@@ -345,11 +348,15 @@ def get_credentials(
     credentials_json = os.environ.get(CREDENTIALS_ENV_VAR)
     if credentials_json:
         return _get_credentials_from_dict(_parse_credentials_json(credentials_json), token_path)
-    
+
     # Fall back to file path
     if fpath is None:
-        fpath = "service_account.json"
-    
+        raise FileNotFoundError(
+            "Credentials required: set GOOGLE_CREDENTIALS (e.g. via Bitwarden) or pass --credentials-fpath / -c"
+        )
+    if not os.path.isfile(fpath):
+        raise FileNotFoundError(f"Credentials file not found: {fpath}")
+
     with open(fpath, "r") as f:
         data = json.load(f)
     return _get_credentials_from_dict(data, token_path)
@@ -1502,8 +1509,8 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                     flow.fetch_token(code=code)
                     creds = flow.credentials
                     
-                    # Convert credentials to token dict
-                    token = {
+                    # Convert credentials to token dict (full, for success page / CLI)
+                    token_full = {
                         'token': creds.token,
                         'refresh_token': creds.refresh_token,
                         'token_uri': creds.token_uri,
@@ -1512,14 +1519,22 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                         'scopes': list(creds.scopes) if creds.scopes else SCOPES,
                     }
                     if creds.expiry:
-                        token['expiry'] = creds.expiry.isoformat()
+                        token_full['expiry'] = creds.expiry.isoformat()
 
-                    # Check if there's a CLI callback waiting
+                    # Check if there's an external callback (e.g. MCP oauth2callback)
                     session = pending_sessions.get(state)
                     if session and session.get('callback'):
                         from urllib.parse import quote
-                        token_param = quote(json.dumps(token))
-                        callback_url = f"{session['callback']}?token={token_param}"
+                        # Never put client_id/client_secret in the redirect URL (security)
+                        token_safe = {k: v for k, v in token_full.items() if k not in ('client_id', 'client_secret')}
+                        # Include user email so the MCP does not need to call userinfo (avoids scope/valid issues)
+                        account_email = _fetch_user_email(creds.token)
+                        if account_email:
+                            token_safe["email"] = account_email
+                            token_safe["account_email"] = account_email
+                        token_param = quote(json.dumps(token_safe))
+                        # Echo state so the MCP can resolve the bound mcp_session_id and store credentials for the right session
+                        callback_url = f"{session['callback']}?token={token_param}&state={quote(state)}"
                         del pending_sessions[state]
                         self._send_redirect(callback_url)
                         return
@@ -1527,7 +1542,7 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                     # No CLI callback, show success page
                     if state in pending_sessions:
                         del pending_sessions[state]
-                    self._send_html(_generate_success_page(token, state or ''))
+                    self._send_html(_generate_success_page(token_full, state or ''))
                     
                 except Exception as e:
                     self._send_html(_generate_landing_page(base_url, f"Failed to exchange code for token: {e}"))
