@@ -48,6 +48,18 @@ do_run() {
     echo "Container 'gdrive' started successfully."
 }
 
+do_serve() {
+    local port="${1:-8080}"
+    echo "Starting HTTP server on port ${port}..."
+    echo "Server will be available at http://localhost:${port}"
+    
+    # Open browser after a short delay
+    (sleep 1 && open "http://localhost:${port}") &
+    
+    # Start HTTP server in web directory
+    cd web && python3 -m http.server "${port}"
+}
+
 # Parse: ./clidev build [nodejs|python]  (no .env) or ./clidev [nodejs|python]  (needs .env)
 case "${1:-nodejs}" in
     build)
@@ -57,9 +69,13 @@ case "${1:-nodejs}" in
         source .env
         do_run "$1"
         ;;
+    serve|web)
+        do_serve "${2:-8080}"
+        ;;
     *)
         echo "Usage: $0 build [nodejs|python]" >&2
         echo "   or: $0 [nodejs|python]" >&2
+        echo "   or: $0 serve [port]" >&2
         exit 1
         ;;
 esac

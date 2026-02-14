@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>gdrive - Simple CLI for Google Drive</title>
-  <meta name="description" content="A lightweight CLI tool for Google Drive. Upload, export, and sync files without creating credentials.">
+  <title>API CLI - OAuth API Interaction Tool</title>
+  <meta name="description" content="A lightweight CLI tool for interacting with OAuth-enabled APIs. Extend with custom skills to interact with any remote API.">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -15,7 +15,7 @@
           <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
           <polyline points="22 4 12 14.01 9 11.01"/>
         </svg>
-        gdrive
+        API CLI
       </a>
       <ul>
         <li><a href="https://github.com/nillebco/gdrive">GitHub</a></li>
@@ -28,8 +28,8 @@
   <main>
     <section class="hero">
       <div class="container">
-        <h1>Google Drive from <span>your terminal</span></h1>
-        <p>A lightweight CLI to upload, export, and sync files with Google Drive. No credentials setup required.</p>
+        <h1>OAuth API access from <span>your terminal</span></h1>
+        <p>A lightweight CLI to interact with any OAuth-enabled API. Create custom SKILL.md files to extend functionality. No manual credential setup required.</p>
         <div class="cta-group">
           <a href="https://github.com/nillebco/gdrive" class="btn btn-primary">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
@@ -51,8 +51,8 @@
                 <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
               </svg>
             </div>
-            <h3>No Credentials Required</h3>
-            <p>Set <code>GDRIVE_TOKEN_SERVER</code> and authenticate instantly. No OAuth credentials or Google Cloud Console needed.</p>
+            <h3>Unified OAuth Authentication</h3>
+            <p>Set <code>API_TOKEN_SERVER</code> and authenticate instantly. Seamlessly handle OAuth flows without manual credential management.</p>
           </div>
           <div class="feature">
             <div class="feature-icon">
@@ -62,8 +62,8 @@
                 <line x1="12" y1="3" x2="12" y2="15"/>
               </svg>
             </div>
-            <h3>Upload & Export</h3>
-            <p>Upload local files and export Google Docs, Sheets, and Slides to Markdown, PDF, DOCX, and more.</p>
+            <h3>Extensible Skills Framework</h3>
+            <p>Write custom SKILL.md files to define operations for any OAuth-enabled API. Any agent can then use these skills automatically.</p>
           </div>
           <div class="feature">
             <div class="feature-icon">
@@ -73,8 +73,8 @@
                 <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
               </svg>
             </div>
-            <h3>Sync Both Ways</h3>
-            <p>Pull latest changes from Drive and push local edits back. Keep everything in sync with one command.</p>
+            <h3>Flexible API Integration</h3>
+            <p>Interact with any OAuth-supporting service. Work with multiple APIs simultaneously. Google Drive, Dropbox, and other OAuth providers are all supported.</p>
           </div>
           <div class="feature">
             <div class="feature-icon">
@@ -84,8 +84,8 @@
                 <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
               </svg>
             </div>
-            <h3>Shared Drives</h3>
-            <p>Full support for Google Shared Drives. Upload, export, and share files across your organization.</p>
+            <h3>Team-Ready Architecture</h3>
+            <p>Share skills across your organization. Define once, use everywhere. Perfect for team collaboration on API interactions.</p>
           </div>
           <div class="feature">
             <div class="feature-icon">
@@ -96,8 +96,8 @@
                 <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
               </svg>
             </div>
-            <h3>Easy Sharing</h3>
-            <p>Share uploaded files with teammates directly from the command line. Set viewer, editor, or commenter roles.</p>
+            <h3>Agent-Ready</h3>
+            <p>Agents automatically discover and use your custom skills. Extend AI capabilities without coding in the main application.</p>
           </div>
           <div class="feature">
             <div class="feature-icon">
@@ -107,8 +107,8 @@
                 <line x1="15" y1="9" x2="9" y2="15"/>
               </svg>
             </div>
-            <h3>Zero Data Collection</h3>
-            <p>Your files stay between you and Google. We don't collect, store, or process any of your data.</p>
+            <h3>Privacy First</h3>
+            <p>Your credentials and data stay on your machine. We don't collect, store, or process any of your information.</p>
           </div>
         </div>
       </div>
@@ -127,17 +127,20 @@
 <pre><span class="comment"># Clone the repository</span>
 <span class="command">git clone https://github.com/nillebco/gdrive && cd gdrive</span>
 
-<span class="comment"># Set token server URL once (no credentials needed!)</span>
-<span class="command">export GDRIVE_TOKEN_SERVER=<script>document.write(location.origin)</script></span>
+<span class="comment"># Set token server URL once (handles OAuth automatically!)</span>
+<span class="command">export API_TOKEN_SERVER=<script>document.write(location.origin)</script></span>
 
-<span class="comment"># Login via token server</span>
+<span class="comment"># Authenticate</span>
 <span class="command">./cli login</span>
 
-<span class="comment"># Upload a file</span>
-<span class="command">./cli upload document.md</span>
+<span class="comment"># Create a custom SKILL.md to interact with any API</span>
+<span class="command">cat > SKILL.md &lt;&lt;EOF
+# My Custom API Skill
+...
+EOF</span>
 
-<span class="comment"># Sync all your files</span>
-<span class="command">./cli sync</span></pre>
+<span class="comment"># Agents can now use your skill</span>
+<span class="command">./cli skill list</span></pre>
           </div>
         </div>
       </div>
@@ -146,7 +149,7 @@
 
   <footer>
     <div class="container">
-      <p>gdrive - Open source CLI for Google Drive</p>
+      <p>API CLI - Open source CLI for OAuth API interaction</p>
       <ul>
         <li><a href="https://github.com/nillebco/gdrive">GitHub</a></li>
         <li><a href="privacy.html">Privacy Policy</a></li>
