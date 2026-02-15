@@ -383,8 +383,10 @@ function normalizeToken(token) {
  */
 function saveToken(tokens, tokenPath = null, accountEmail = null) {
   const filePath = tokenPath || DEFAULT_TOKEN_PATH;
-  // Include client_id (public) but exclude client_secret (private)
-  const { client_secret, ...tokenData } = tokens;
+  // Strip client_id and client_secret — they belong to the OAuth app (or token server),
+  // not to the end user. Keeping them would cause googleapis to attempt auto-refresh
+  // with credentials it doesn't actually own.
+  const { client_id, client_secret, ...tokenData } = tokens;
   const dataToSave = { ...tokenData };
   if (accountEmail) {
     dataToSave.account_email = accountEmail;
@@ -2172,8 +2174,8 @@ async function startTokenServer(port, credentialsFpath = null) {
           // Check if there's a CLI callback waiting
           const session = pendingSessions.get(state);
           if (session?.callback) {
-            // Include client_id (public) but strip client_secret (private) for security
-            const { client_secret, ...safeTokens } = tokens;
+            // Strip both client_id and client_secret — they belong to the server
+            const { client_id, client_secret, ...safeTokens } = tokens;
             // Redirect to CLI's local server with the token
             const tokenParam = encodeURIComponent(JSON.stringify(safeTokens));
             const callbackUrl = `${session.callback}?token=${tokenParam}`;
@@ -2186,8 +2188,8 @@ async function startTokenServer(port, credentialsFpath = null) {
           
           // No CLI callback, show the success page with token
           pendingSessions.delete(state);
-          // Include client_id (public) but strip client_secret (private) for security
-          const { client_secret, ...safeTokens } = tokens;
+          // Strip both client_id and client_secret — they belong to the server
+          const { client_id, client_secret, ...safeTokens } = tokens;
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end(generateSuccessPage(safeTokens, state));
         } catch (err) {

@@ -177,9 +177,13 @@ def _load_token(
         # For token server tokens, we just need the access token to be valid
         # Refresh will be handled separately via _refresh_token_via_server
         try:
-            # Build minimal credentials object (without client_id/client_secret)
+            # Use client_id from token if available (server now includes it), otherwise placeholder
+            # Note: The Google API library only uses the Bearer token for requests, not client_id
+            client_id = token_data.get('client_id', 'placeholder')
+            client_secret = token_data.get('client_secret', 'placeholder')
+            
             return OAuthCredentials.from_authorized_user_info(
-                {**token_data, 'client_id': 'placeholder', 'client_secret': 'placeholder'},
+                {**token_data, 'client_id': client_id, 'client_secret': client_secret},
                 SCOPES
             )
         except Exception as ex:
@@ -204,8 +208,7 @@ def _save_token(creds: OAuthCredentials, token_path: Optional[str] = None, accou
     path = token_path or DEFAULT_TOKEN_PATH
     # Parse the credentials JSON and add account_email if provided
     token_data = json.loads(creds.to_json())
-    # Remove client_id and client_secret - they should come from GOOGLE_CREDENTIALS
-    token_data.pop("client_id", None)
+    # Include client_id (public) but remove client_secret (private) for security
     token_data.pop("client_secret", None)
     if account_email:
         token_data["account_email"] = account_email
@@ -867,7 +870,35 @@ def pull_all(
             record.last_operation = datetime.now(timezone.utc)
             results.append(output_path)
         except Exception as e:
-            print(f"Warning: Failed to re-export {output_path}: {e}")
+            # Provide detailed error information
+            print(f"Warning: Failed to re-export {output_path}:")
+            print(f"  File ID: {file_id}")
+            print(f"  Export format: {export_format} ({mime_type})")
+            print(f"  Error type: {type(e).__name__}")
+            print(f"  Error: {e}")
+            
+            # Log HTTP details if available
+            if hasattr(e, 'resp'):
+                print(f"  HTTP Status: {e.resp.status}")
+                if hasattr(e.resp, 'reason'):
+                    print(f"  HTTP Reason: {e.resp.reason}")
+            
+            # Log error details from Google API
+            if hasattr(e, 'error_details'):
+                import pprint
+                print(f"  API Error Details:")
+                pprint.pprint(e.error_details, indent=4)
+            
+            # Try to parse error content
+            if hasattr(e, 'content'):
+                try:
+                    error_content = json.loads(e.content)
+                    print(f"  API Response:")
+                    import pprint
+                    pprint.pprint(error_content, indent=4)
+                except Exception:
+                    print(f"  Raw content: {e.content}")
+            
             continue
     
     # Save updated mapping
