@@ -66,7 +66,7 @@ If someone in your organization runs a token server, you can authenticate withou
 
 ```bash
 # Set the token server URL once via environment variable
-export GDRIVE_TOKEN_SERVER=http://your-server:8080
+export OAUTH_TOKEN_SERVER=http://your-server:8080
 
 # Then just use the CLI normally
 ./cli login
@@ -610,7 +610,7 @@ Share an uploaded file with one or more email addresses.
 |----------|-------------|
 | `GOOGLE_CREDENTIALS` | JSON content of the credentials file (OAuth or Service Account) |
 | `GOOGLE_TOKEN` | JSON content of the OAuth token (alternative to `token.json` file) |
-| `GDRIVE_TOKEN_SERVER` | URL of token server for authentication (alternative to `--token-server` option) |
+| `OAUTH_TOKEN_SERVER` | URL of token server for authentication (alternative to `--token-server` option) |
 
 **Docker:** When running the app in Docker, pass credentials via `--env-file .env` so the JSON is not broken by the shell. In your `.env` file use raw JSON (no quotes around the value), e.g. `GOOGLE_CREDENTIALS={"installed":{"client_id":"..."}}`.
 
@@ -624,13 +624,18 @@ The OAuth token is stored in `token.json` with the following structure:
   "refresh_token": "1//...",
   "token_uri": "https://oauth2.googleapis.com/token",
   "scopes": ["https://www.googleapis.com/auth/drive"],
-  "account_email": "user@example.com"
+  "account_email": "user@example.com",
+  "issuer": "https://accounts.google.com",
+  "token_server": "http://localhost:8080"
 }
 ```
 
-Note: `client_id` and `client_secret` are **not** stored in `token.json`. They are read from the `GOOGLE_CREDENTIALS` environment variable or `credentials.json` file during authentication and token refresh operations.
+**Note:** `client_id` and `client_secret` are **not** stored in `token.json`. They are read from the `GOOGLE_CREDENTIALS` environment variable or `credentials.json` file during authentication and token refresh operations.
 
-The `account_email` field is automatically fetched from Google's userinfo API during authentication and stored for quick identification. Use `./cli whoami` to see the current account.
+**Field Descriptions:**
+- `account_email` - Automatically fetched from Google's userinfo API during authentication for quick identification (use `./cli whoami` to display)
+- `issuer` - OAuth issuer identifier (`https://accounts.google.com`) for token validation
+- `token_server` - URL of the token server that issued this token (e.g., `http://localhost:8080`). **Automatically used for token refresh** - you don't need to specify `--token-server` on subsequent commands
 
 ## Files Mapping
 
@@ -739,6 +744,22 @@ The token server allows users without their own Google Cloud credentials to auth
 - You want to simplify onboarding for new users
 - You need to provide CLI access to external collaborators
 
+### Multiple Server Types Support
+
+The CLI automatically detects and works with different token server implementations:
+
+1. **gdrive server** (this repository) - Lightweight Python/Node.js server with fully automated OAuth
+2. **Next.js server** - Full-featured web application (e.g., obsidian-google-drive-website) with manual token copy/paste
+
+The adapter automatically detects the server type and adapts the authentication flow accordingly.
+
+**Note:** Next.js servers require a semi-manual flow where you:
+1. Complete OAuth in the browser
+2. Copy the displayed refresh token  
+3. Paste it into the CLI
+
+This is because Next.js servers are designed for browser-based OAuth (Obsidian plugin use case) and only display the refresh token, not full token JSON. See [USAGE_WITH_NEXTJS.md](USAGE_WITH_NEXTJS.md) for detailed instructions.
+
 ### Setting Up a Token Server
 
 The server accepts **Web application** or **Desktop (installed)** OAuth credentials (both Python and Node.js implementations). For running a token server, **Web application** is recommended.
@@ -816,12 +837,25 @@ gdrive/
 ├── README.md
 ├── python/          # Python implementation (default)
 │   ├── main.py
+│   ├── token_server_adapter.py  # Universal token server adapter
 │   ├── pyproject.toml
 │   └── uv.lock
 └── nodejs/          # Node.js implementation (use --node flag)
     ├── main.js
+    ├── token-server-adapter.js   # Universal token server adapter
     ├── package.json
     └── README.md
 ```
 
 Both implementations have feature parity and use the same `files-mapping.json` format, so you can switch between them as needed.
+
+### Token Server Adapter
+
+The `token_server_adapter.py` (Python) and `token-server-adapter.js` (Node.js) modules provide a unified interface for communicating with different OAuth token server implementations. The adapter:
+
+- **Auto-detects** server type by probing endpoints (`/health` for gdrive, `/api/ping` for Next.js)
+- **Adapts** authentication flow based on server capabilities
+- **Transforms** responses to a common format
+- **Supports** both token fetching and token refresh operations
+
+This allows the CLI to work seamlessly with multiple token server implementations without any user configuration.

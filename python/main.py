@@ -28,7 +28,7 @@ SCOPES = [
 
 CREDENTIALS_ENV_VAR = "GOOGLE_CREDENTIALS"
 TOKEN_ENV_VAR = "GOOGLE_TOKEN"
-TOKEN_SERVER_ENV_VAR = "GDRIVE_TOKEN_SERVER"
+TOKEN_SERVER_ENV_VAR = "OAUTH_TOKEN_SERVER"
 DEFAULT_TOKEN_PATH = "token.json"
 DEFAULT_MAPPING_PATH = "files-mapping.json"
 DEFAULT_SERVER_PORT = 8080
@@ -149,7 +149,8 @@ def _load_token(
         token_path: Path to token.json file
         client_id: OAuth client ID (required for token refresh without server)
         client_secret: OAuth client secret (required for token refresh without server)
-        token_server: Token server URL (for server-side refresh)
+        token_server: Token server URL (for server-side refresh). If not provided,
+                     will check if token file has a saved token_server field.
     """
     token_data = None
 
@@ -166,6 +167,10 @@ def _load_token(
 
     if token_data is None:
         return None
+    
+    # If no token_server provided, check if token has one saved
+    if not token_server and "token_server" in token_data:
+        token_server = token_data["token_server"]
 
     # If using token server, we don't need client credentials
     if token_server:
@@ -339,9 +344,19 @@ def _get_credentials_client_secret_from_dict(
     # Try to refresh expired token
     if creds and creds.expired and creds.refresh_token:
         try:
+            # Check if token has a saved token_server (if not provided explicitly)
+            detected_token_server = token_server
+            if not detected_token_server:
+                # Load token file to check for saved token_server
+                path = token_path or DEFAULT_TOKEN_PATH
+                if os.path.exists(path):
+                    with open(path, "r") as f:
+                        token_data = json.load(f)
+                        detected_token_server = token_data.get("token_server")
+            
             # If using token server, refresh via server
-            if token_server:
-                refreshed_creds = _refresh_token_via_server(token_path, token_server)
+            if detected_token_server:
+                refreshed_creds = _refresh_token_via_server(token_path, detected_token_server)
                 if refreshed_creds:
                     return refreshed_creds
                 # If server refresh failed, fall through to OAuth flow
@@ -422,6 +437,28 @@ def get_credentials(
         token_path: Path to token file
         token_server: Token server URL (for server-side token refresh)
     """
+    # If using token server, try to load existing token first (no credentials file needed)
+    server_url = token_server or _get_token_server(None)
+    if server_url:
+        # Try to load existing token from token server
+        existing_creds = _load_token(token_path, token_server=server_url)
+        if existing_creds:
+            # Check if token needs refresh
+            if existing_creds.expired and existing_creds.refresh_token:
+                refreshed_creds = _refresh_token_via_server(token_path, server_url)
+                if refreshed_creds and refreshed_creds.valid:
+                    return refreshed_creds
+            elif existing_creds.valid:
+                return existing_creds
+        
+        # No valid token found, need to authenticate via token server
+        # This should have been done already via `./cli login --token-server`
+        raise FileNotFoundError(
+            f"No valid token found for token server {server_url}. "
+            f"Please authenticate first: ./cli login --token-server {server_url}"
+        )
+    
+    # Not using token server, need OAuth credentials file
     # First, check environment variable
     credentials_json = os.environ.get(CREDENTIALS_ENV_VAR)
     if credentials_json:
@@ -1412,6 +1449,8 @@ def _generate_success_page(token: dict, session_id: str) -> str:
 def _refresh_token_from_server(server_url: str, refresh_token: str) -> Optional[dict]:
     """Refresh an access token using the token server.
     
+    This function uses the TokenServerAdapter to support multiple server types.
+    
     Args:
         server_url: URL of the token server
         refresh_token: The refresh token to use
@@ -1419,41 +1458,22 @@ def _refresh_token_from_server(server_url: str, refresh_token: str) -> Optional[
     Returns:
         Dict with 'token' and 'expiry', or None if refresh failed
     """
-    import urllib.request
-    import urllib.error
-    
-    refresh_url = f"{server_url.rstrip('/')}/auth/refresh"
-    
-    request_data = json.dumps({'refresh_token': refresh_token}).encode('utf-8')
+    from token_server_adapter import create_adapter
     
     try:
-        req = urllib.request.Request(
-            refresh_url,
-            data=request_data,
-            headers={'Content-Type': 'application/json'},
-            method='POST'
-        )
-        
-        with urllib.request.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode('utf-8'))
-            return result
-    except urllib.error.HTTPError as e:
-        # Read error response for debugging
-        try:
-            error_body = e.read().decode('utf-8')
-            error_data = json.loads(error_body)
-            print(f"Token refresh failed: {error_data.get('error', 'Unknown error')}")
-        except Exception:
-            print(f"Token refresh failed with HTTP {e.code} {repr(e)}")
-        return None
+        adapter = create_adapter(server_url)
+        return adapter.refresh_token(refresh_token)
     except Exception as e:
         print(f"Token refresh failed: {e}")
         return None
 
 
 def _fetch_token_from_server(server_url: str, token_path: Optional[str] = None) -> None:
-    """Fetch token from a token server."""
-    from urllib.parse import quote
+    """Fetch token from a token server.
+    
+    This function uses the TokenServerAdapter to support multiple server types.
+    """
+    from token_server_adapter import create_adapter
     
     # Check if we already have a valid token
     existing_token = _load_token(token_path, token_server=server_url)
@@ -1466,76 +1486,15 @@ def _fetch_token_from_server(server_url: str, token_path: Optional[str] = None) 
         if refreshed_creds and refreshed_creds.valid:
             return
     
-    print(f"Opening browser to authenticate via {server_url}...")
+    # Fetch new token using adapter
+    adapter = create_adapter(server_url)
+    token_data = adapter.fetch_token_interactive(token_path)
     
-    # Generate a session ID
-    session_id = secrets.token_hex(16)
-    
-    # Token received flag
-    token_received = threading.Event()
-    received_token = [None]  # Using list to allow modification in nested function
-    
-    class CallbackHandler(BaseHTTPRequestHandler):
-        def log_message(self, format, *args):
-            pass  # Suppress logging
-        
-        def do_GET(self):
-            parsed = urlparse(self.path)
-            if parsed.path == '/callback':
-                params = parse_qs(parsed.query)
-                if 'token' in params:
-                    try:
-                        token_data = json.loads(params['token'][0])
-                        received_token[0] = token_data
-                        
-                        self.send_response(200)
-                        self.send_header('Content-Type', 'text/html')
-                        self.end_headers()
-                        self.wfile.write(b'''
-                            <html>
-                                <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-                                    <h1>Token received!</h1>
-                                    <p>You can close this window and return to the terminal.</p>
-                                </body>
-                            </html>
-                        ''')
-                        token_received.set()
-                    except Exception as e:
-                        self.send_response(400)
-                        self.end_headers()
-                        self.wfile.write(f"Error: {e}".encode())
-                else:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"No token received")
-    
-    # Start local server on a random port
-    with socketserver.TCPServer(('localhost', 0), CallbackHandler) as httpd:
-        local_port = httpd.server_address[1]
-        callback_url = quote(f"http://localhost:{local_port}/callback")
-        auth_url = f"{server_url}/auth/start?callback={callback_url}&session={session_id}"
-        
-        # Open browser
-        webbrowser.open(auth_url)
-        
-        # Wait for callback with timeout
-        httpd.timeout = 1
-        start_time = datetime.now()
-        timeout = 300  # 5 minutes
-        
-        while not token_received.is_set():
-            httpd.handle_request()
-            if (datetime.now() - start_time).total_seconds() > timeout:
-                raise TimeoutError("Authentication timed out")
-    
-    if received_token[0]:
-        # Save the token
-        path = token_path or DEFAULT_TOKEN_PATH
-        with open(path, 'w') as f:
-            json.dump(received_token[0], f, indent=2)
-        print("Token saved successfully!")
-    else:
-        raise RuntimeError("Failed to receive token")
+    # Save the token
+    path = token_path or DEFAULT_TOKEN_PATH
+    with open(path, 'w') as f:
+        json.dump(token_data, f, indent=2)
+    print("Token saved successfully!")
 
 
 def _request_base_url(handler: BaseHTTPRequestHandler, fallback_port: int) -> str:
@@ -1854,7 +1813,7 @@ def login(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
     force: Annotated[
@@ -2031,7 +1990,7 @@ def upload(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
     folder_id: Annotated[
@@ -2131,7 +2090,7 @@ def export(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
     drive_id: Annotated[
@@ -2228,7 +2187,7 @@ def share(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -2293,7 +2252,7 @@ def pull(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -2360,7 +2319,7 @@ def push(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -2427,7 +2386,7 @@ def sync(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
 ):
@@ -2498,7 +2457,7 @@ def list_drives(
         Optional[str],
         typer.Option(
             "--token-server",
-            help="URL of token server to fetch OAuth token from (or set GDRIVE_TOKEN_SERVER env var)"
+            help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
     query: Annotated[

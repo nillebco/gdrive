@@ -13,7 +13,7 @@ import { Command } from 'commander';
 const SCOPES = ['https://www.googleapis.com/auth/drive'];
 const CREDENTIALS_ENV_VAR = 'GOOGLE_CREDENTIALS';
 const TOKEN_ENV_VAR = 'GOOGLE_TOKEN';
-const TOKEN_SERVER_ENV_VAR = 'GDRIVE_TOKEN_SERVER';
+const TOKEN_SERVER_ENV_VAR = 'OAUTH_TOKEN_SERVER';
 const DEFAULT_TOKEN_PATH = 'token.json';
 const DEFAULT_MAPPING_PATH = 'files-mapping.json';
 const DEFAULT_SERVER_PORT = 8080;
@@ -499,9 +499,12 @@ async function getCredentialsClientSecretFromDict(data, tokenPath = null, tokenS
     if (tokenData.expiry_date && Date.now() >= tokenData.expiry_date) {
       if (tokenData.refresh_token) {
         try {
+          // Check if token has a saved token_server (if not provided explicitly)
+          const detectedTokenServer = tokenServer || tokenData.token_server;
+          
           // If using token server, refresh via server
-          if (tokenServer) {
-            const refreshedToken = await refreshTokenViaServer(tokenPath, tokenServer);
+          if (detectedTokenServer) {
+            const refreshedToken = await refreshTokenViaServer(tokenPath, detectedTokenServer);
             if (refreshedToken) {
               oauth2Client.setCredentials(refreshedToken);
               return oauth2Client;
@@ -579,6 +582,48 @@ async function getCredentialsFromDict(data, tokenPath = null, tokenServer = null
  * @returns {Promise<google.auth.OAuth2|google.auth.JWT>} Auth client
  */
 async function getCredentials(fpath = null, tokenPath = null, tokenServer = null) {
+  // If using token server, try to load existing token first (no credentials file needed)
+  const serverUrl = tokenServer || getTokenServer(null);
+  if (serverUrl) {
+    // Try to load existing token
+    const tokenData = loadToken(tokenPath);
+    if (tokenData) {
+      // Check if token has saved server, prefer that
+      const detectedTokenServer = tokenData.token_server || serverUrl;
+      
+      // Create OAuth2 client with placeholder credentials (not used for token server)
+      const oauth2Client = new google.auth.OAuth2();
+      oauth2Client.setCredentials(tokenData);
+      
+      // Check if token needs refresh
+      if (tokenData.expiry_date && Date.now() >= tokenData.expiry_date) {
+        if (tokenData.refresh_token) {
+          // Refresh via token server
+          const refreshedToken = await refreshTokenViaServer(tokenPath, detectedTokenServer);
+          if (refreshedToken) {
+            oauth2Client.setCredentials(refreshedToken);
+            return oauth2Client;
+          }
+        }
+        // Token expired and couldn't refresh
+        throw new Error(
+          `Token expired and refresh failed for server ${detectedTokenServer}. ` +
+          `Please re-authenticate: ./cli login --token-server ${detectedTokenServer}`
+        );
+      }
+      
+      // Token is valid
+      return oauth2Client;
+    }
+    
+    // No token found
+    throw new Error(
+      `No valid token found for token server ${serverUrl}. ` +
+      `Please authenticate first: ./cli login --token-server ${serverUrl}`
+    );
+  }
+  
+  // Not using token server, need OAuth credentials file
   // First, check environment variable
   const credentialsJson = process.env[CREDENTIALS_ENV_VAR];
   if (credentialsJson) {
@@ -1834,24 +1879,12 @@ function escapeHtml(str) {
  * @returns {Promise<object|null>} Object with 'token' and 'expiry', or null if refresh failed
  */
 async function refreshTokenFromServer(serverUrl, refreshToken) {
-  const refreshUrl = `${serverUrl.replace(/\/$/, '')}/auth/refresh`;
+  // Use the TokenServerAdapter to support multiple server types
+  const { createAdapter } = await import('./token-server-adapter.js');
   
   try {
-    const response = await fetch(refreshUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ refresh_token: refreshToken }),
-    });
-    
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      console.error('Token refresh failed:', errorData.error || `HTTP ${response.status}`);
-      return null;
-    }
-    
-    return await response.json();
+    const adapter = createAdapter(serverUrl);
+    return await adapter.refreshToken(refreshToken);
   } catch (error) {
     console.error('Token refresh failed:', error.message);
     return null;
@@ -1917,65 +1950,15 @@ async function fetchTokenFromServer(serverUrl, tokenPath = null) {
     }
   }
 
-  console.log(`Opening browser to authenticate via ${serverUrl}...`);
+  // Use the TokenServerAdapter to support multiple server types
+  const { createAdapter } = await import('./token-server-adapter.js');
   
-  // Generate a session ID for this CLI instance
-  const sessionId = crypto.randomBytes(16).toString('hex');
+  const adapter = createAdapter(serverUrl);
+  const tokenData = await adapter.fetchTokenInteractive(tokenPath);
   
-  // Start a local server to receive the token
-  return new Promise((resolve, reject) => {
-    const localServer = http.createServer(async (req, res) => {
-      try {
-        const url = new URL(req.url, 'http://localhost');
-        
-        if (url.pathname === '/callback') {
-          const tokenParam = url.searchParams.get('token');
-          
-          if (tokenParam) {
-            const token = JSON.parse(decodeURIComponent(tokenParam));
-            saveToken(token, tokenPath);
-            
-            res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end(`
-              <html>
-                <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-                  <h1>✓ Token received!</h1>
-                  <p>You can close this window and return to the terminal.</p>
-                </body>
-              </html>
-            `);
-            
-            localServer.close();
-            resolve();
-          } else {
-            res.writeHead(400, { 'Content-Type': 'text/plain' });
-            res.end('No token received');
-            localServer.close();
-            reject(new Error('No token received from server'));
-          }
-        }
-      } catch (error) {
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('Error processing callback');
-        localServer.close();
-        reject(error);
-      }
-    });
-
-    localServer.listen(0, async () => {
-      const port = localServer.address().port;
-      const callbackUrl = encodeURIComponent(`http://localhost:${port}/callback`);
-      const authUrl = `${serverUrl}/auth/start?callback=${callbackUrl}&session=${sessionId}`;
-      
-      await open(authUrl);
-    });
-
-    // Timeout after 5 minutes
-    setTimeout(() => {
-      localServer.close();
-      reject(new Error('Authentication timed out'));
-    }, 5 * 60 * 1000);
-  });
+  // Save the token
+  saveToken(tokenData, tokenPath);
+  console.log('Token saved successfully!');
 }
 
 /**
