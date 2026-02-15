@@ -327,7 +327,8 @@ function loadToken(tokenPath = null) {
   const tokenJson = process.env[TOKEN_ENV_VAR];
   if (tokenJson) {
     try {
-      return JSON.parse(tokenJson);
+      const token = JSON.parse(tokenJson);
+      return normalizeToken(token);
     } catch {
       return null;
     }
@@ -338,7 +339,8 @@ function loadToken(tokenPath = null) {
   if (fs.existsSync(filePath)) {
     try {
       const content = fs.readFileSync(filePath, 'utf8');
-      return JSON.parse(content);
+      const token = JSON.parse(content);
+      return normalizeToken(token);
     } catch {
       return null;
     }
@@ -348,16 +350,41 @@ function loadToken(tokenPath = null) {
 }
 
 /**
+ * Normalize token format to ensure both 'expiry' and 'expiry_date' fields.
+ * @param {object} token - Token data
+ * @returns {object} Normalized token
+ */
+function normalizeToken(token) {
+  if (!token) return null;
+  
+  // Ensure we have both expiry (ISO string) and expiry_date (timestamp)
+  if (token.expiry && !token.expiry_date) {
+    token.expiry_date = new Date(token.expiry).getTime();
+  } else if (token.expiry_date && !token.expiry) {
+    token.expiry = new Date(token.expiry_date).toISOString();
+  }
+  
+  // Ensure we have both token and access_token for googleapis compatibility
+  if (token.token && !token.access_token) {
+    token.access_token = token.token;
+  } else if (token.access_token && !token.token) {
+    token.token = token.access_token;
+  }
+  
+  return token;
+}
+
+/**
  * Save OAuth token to file for future use.
- * Excludes client_id and client_secret for security (they're in GOOGLE_CREDENTIALS).
+ * Includes client_id (public) but excludes client_secret (private) for security.
  * @param {object} tokens - Token data to save
  * @param {string|null} tokenPath - Optional path to save token
  * @param {string|null} accountEmail - Optional account email to store
  */
 function saveToken(tokens, tokenPath = null, accountEmail = null) {
   const filePath = tokenPath || DEFAULT_TOKEN_PATH;
-  // Exclude client_id and client_secret - they should come from GOOGLE_CREDENTIALS
-  const { client_id, client_secret, ...tokenData } = tokens;
+  // Include client_id (public) but exclude client_secret (private)
+  const { client_secret, ...tokenData } = tokens;
   const dataToSave = { ...tokenData };
   if (accountEmail) {
     dataToSave.account_email = accountEmail;
@@ -591,26 +618,49 @@ async function getCredentials(fpath = null, tokenPath = null, tokenServer = null
       // Check if token has saved server, prefer that
       const detectedTokenServer = tokenData.token_server || serverUrl;
       
-      // Create OAuth2 client with placeholder credentials (not used for token server)
-      const oauth2Client = new google.auth.OAuth2();
-      oauth2Client.setCredentials(tokenData);
-      
-      // Check if token needs refresh
+      // Check if token needs refresh BEFORE creating OAuth2 client
+      let activeToken = tokenData;
       if (tokenData.expiry_date && Date.now() >= tokenData.expiry_date) {
+        console.log('Token expired, refreshing via token server...');
         if (tokenData.refresh_token) {
           // Refresh via token server
           const refreshedToken = await refreshTokenViaServer(tokenPath, detectedTokenServer);
           if (refreshedToken) {
-            oauth2Client.setCredentials(refreshedToken);
-            return oauth2Client;
+            console.log('Token refreshed successfully');
+            activeToken = refreshedToken;
+          } else {
+            throw new Error(
+              `Token expired and refresh failed for server ${detectedTokenServer}. ` +
+              `Please re-authenticate: ./cli login --token-server ${detectedTokenServer}`
+            );
           }
+        } else {
+          throw new Error(
+            `Token expired and no refresh token available. ` +
+            `Please re-authenticate: ./cli login --token-server ${detectedTokenServer}`
+          );
         }
-        // Token expired and couldn't refresh
-        throw new Error(
-          `Token expired and refresh failed for server ${detectedTokenServer}. ` +
-          `Please re-authenticate: ./cli login --token-server ${detectedTokenServer}`
-        );
       }
+      
+      // Create OAuth2 client with refreshed/valid token.
+      // IMPORTANT: Do NOT pass fake client_id/client_secret and do NOT include
+      // refresh_token in the credentials. If googleapis detects an expired token
+      // or receives a 401, it will try to auto-refresh using client_id/client_secret
+      // from the constructor. With token-server tokens we don't have the real
+      // client_secret, so auto-refresh would fail with "invalid_client".
+      // We handle all refresh logic ourselves before reaching this point.
+      const oauth2Client = new google.auth.OAuth2();
+      // Use saved expiry if in the future; otherwise default to 55 min from now
+      // (Google access tokens last ~1 hour). This prevents googleapis from
+      // attempting auto-refresh when the saved expiry is stale or missing.
+      const expiryDate = (activeToken.expiry_date && activeToken.expiry_date > Date.now())
+        ? activeToken.expiry_date
+        : Date.now() + 55 * 60 * 1000;
+      oauth2Client.setCredentials({
+        access_token: activeToken.access_token || activeToken.token,
+        expiry_date: expiryDate,
+        token_type: 'Bearer',
+      });
       
       // Token is valid
       return oauth2Client;
@@ -861,6 +911,7 @@ async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = 
       const response = await drive.files.export({
         fileId,
         mimeType,
+        supportsAllDrives: true,
       }, {
         responseType: TEXT_FORMATS.has(exportFormat) ? 'text' : 'arraybuffer',
       });
@@ -878,7 +929,43 @@ async function pullAll(credentialsFpath = null, tokenPath = null, mappingPath = 
       record.last_operation = new Date().toISOString();
       results.push(outputPath);
     } catch (error) {
-      console.error(`Warning: Failed to re-export ${outputPath}: ${error.message}`);
+      // Provide detailed error information
+      console.error(`Warning: Failed to re-export ${outputPath}:`);
+      console.error(`  File ID: ${fileId}`);
+      console.error(`  Export format: ${exportFormat} (${mimeType})`);
+      
+      // Log error details
+      if (error.response) {
+        console.error(`  HTTP Status: ${error.response.status} ${error.response.statusText}`);
+        console.error(`  Response data:`, JSON.stringify(error.response.data, null, 2));
+      } else if (error.message) {
+        console.error(`  Error message: ${error.message}`);
+      }
+      
+      // Log full error for debugging
+      if (error.code) {
+        console.error(`  Error code: ${error.code}`);
+      }
+      
+      // Check if it's an API error with structured details
+      const errorDetails = error.response?.data?.error;
+      if (errorDetails) {
+        if (errorDetails.message) {
+          console.error(`  API error message: ${errorDetails.message}`);
+        }
+        if (errorDetails.errors && Array.isArray(errorDetails.errors)) {
+          console.error(`  API error details:`);
+          errorDetails.errors.forEach(e => {
+            console.error(`    - ${e.reason}: ${e.message}`);
+            if (e.location) console.error(`      Location: ${e.location}`);
+            if (e.domain) console.error(`      Domain: ${e.domain}`);
+          });
+        }
+        if (errorDetails.status) {
+          console.error(`  API status: ${errorDetails.status}`);
+        }
+      }
+      
       continue;
     }
   }
@@ -1919,9 +2006,21 @@ async function refreshTokenViaServer(tokenPath, serverUrl) {
     }
     
     // Update token data with new access token
+    // Support both 'token' and 'access_token' fields for compatibility
+    tokenData.token = result.token;
     tokenData.access_token = result.token;
     if (result.expiry) {
+      tokenData.expiry = result.expiry;
       tokenData.expiry_date = new Date(result.expiry).getTime();
+    }
+    
+    // Ensure expiry_date is in the future after a successful refresh.
+    // If the server didn't return an expiry (or it parsed to a past time),
+    // default to 55 minutes from now (Google access tokens last ~1 hour).
+    if (!tokenData.expiry_date || tokenData.expiry_date <= Date.now()) {
+      const defaultExpiry = new Date(Date.now() + 55 * 60 * 1000);
+      tokenData.expiry = defaultExpiry.toISOString();
+      tokenData.expiry_date = defaultExpiry.getTime();
     }
     
     // Save updated token
@@ -1948,9 +2047,19 @@ async function fetchTokenFromServer(serverUrl, tokenPath = null) {
     if (!existingToken.expiry_date || Date.now() < existingToken.expiry_date) {
       return; // Token is still valid
     }
+
+    // Token is expired, try to refresh via token server before interactive auth
+    if (existingToken.refresh_token) {
+      const detectedServer = existingToken.token_server || serverUrl;
+      const refreshedToken = await refreshTokenViaServer(tokenPath, detectedServer);
+      if (refreshedToken) {
+        console.log('Token refreshed successfully via token server.');
+        return;
+      }
+    }
   }
 
-  // Use the TokenServerAdapter to support multiple server types
+  // No valid token and refresh failed (or no refresh_token) — interactive auth
   const { createAdapter } = await import('./token-server-adapter.js');
   
   const adapter = createAdapter(serverUrl);
@@ -2063,8 +2172,8 @@ async function startTokenServer(port, credentialsFpath = null) {
           // Check if there's a CLI callback waiting
           const session = pendingSessions.get(state);
           if (session?.callback) {
-            // Filter out any potential credential fields before sending (defensive)
-            const { client_id, client_secret, ...safeTokens } = tokens;
+            // Include client_id (public) but strip client_secret (private) for security
+            const { client_secret, ...safeTokens } = tokens;
             // Redirect to CLI's local server with the token
             const tokenParam = encodeURIComponent(JSON.stringify(safeTokens));
             const callbackUrl = `${session.callback}?token=${tokenParam}`;
@@ -2077,8 +2186,8 @@ async function startTokenServer(port, credentialsFpath = null) {
           
           // No CLI callback, show the success page with token
           pendingSessions.delete(state);
-          // Filter out any potential credential fields before displaying (defensive)
-          const { client_id, client_secret, ...safeTokens } = tokens;
+          // Include client_id (public) but strip client_secret (private) for security
+          const { client_secret, ...safeTokens } = tokens;
           res.writeHead(200, { 'Content-Type': 'text/html' });
           res.end(generateSuccessPage(safeTokens, state));
         } catch (err) {

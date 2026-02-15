@@ -349,9 +349,17 @@ export class TokenServerAdapter {
       const isHttps = urlObj.protocol === 'https:';
       const httpModule = isHttps ? https : http;
 
+      // Prepare headers
+      const requestHeaders = { ...headers };
+      
+      // Add Content-Length if we have data
+      if (data) {
+        requestHeaders['Content-Length'] = Buffer.byteLength(data);
+      }
+
       const options = {
         method,
-        headers: headers || {},
+        headers: requestHeaders,
         timeout,
       };
 
