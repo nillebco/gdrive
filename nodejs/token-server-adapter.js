@@ -252,7 +252,7 @@ export class TokenServerAdapter {
                   refresh_token: refreshToken,
                   expiry: result.expiry,
                   token_uri: 'https://oauth2.googleapis.com/token',
-                  scopes: ['https://www.googleapis.com/auth/drive.file'],
+                  scopes: ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/userinfo.email'],
                   issuer: 'https://accounts.google.com',
                   token_server: serverUrl,
                 };

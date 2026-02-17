@@ -10,7 +10,10 @@ import open from 'open';
 import { google } from 'googleapis';
 import { Command } from 'commander';
 
-const SCOPES = ['https://www.googleapis.com/auth/drive'];
+const SCOPES = [
+  'https://www.googleapis.com/auth/drive',
+  'https://www.googleapis.com/auth/userinfo.email',
+];
 const CREDENTIALS_ENV_VAR = 'GOOGLE_CREDENTIALS';
 const TOKEN_ENV_VAR = 'GOOGLE_TOKEN';
 const TOKEN_SERVER_ENV_VAR = 'OAUTH_TOKEN_SERVER';
