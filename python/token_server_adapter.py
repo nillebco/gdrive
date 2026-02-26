@@ -167,7 +167,8 @@ class TokenServerAdapter:
             local_port = httpd.server_address[1]
             callback_url = quote(f"http://localhost:{local_port}/callback")
             auth_url = f"{self.server_url}/auth/start?callback={callback_url}&session={session_id}"
-            
+            print(f"Authenticate at: {auth_url}")
+
             # Open browser
             webbrowser.open(auth_url)
             

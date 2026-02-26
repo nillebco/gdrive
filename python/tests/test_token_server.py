@@ -171,7 +171,7 @@ def test_token_parsing():
         "token_uri": "https://oauth2.googleapis.com/token",
         "client_id": "test-client-id.apps.googleusercontent.com",
         "client_secret": "test-secret",
-        "scopes": ["https://www.googleapis.com/auth/drive"],
+        "scopes": ["https://www.googleapis.com/auth/drive.file"],
         "expiry": "2025-02-01T12:00:00.000000"
     }
 

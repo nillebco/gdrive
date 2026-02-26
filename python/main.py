@@ -21,10 +21,16 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from pydantic import BaseModel
 
+# Include openid so requested scopes match what Google returns when using userinfo.email
+# (avoids "Scope has changed" warning when using client credentials without token server)
 SCOPES = [
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/userinfo.email",
+    "openid",
 ]
+
+# Relax scope validation so token response can include openid / reordered scopes
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 CREDENTIALS_ENV_VAR = "GOOGLE_CREDENTIALS"
 TOKEN_ENV_VAR = "GOOGLE_TOKEN"
@@ -1634,10 +1640,6 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                 redirect_uri = f"{base_url}/auth/callback"
                 
                 try:
-                    # Set environment variable to allow scope changes
-                    # Google may return additional previously-granted scopes
-                    os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
-                    
                     flow = Flow.from_client_config(
                         self.credentials,
                         scopes=SCOPES,

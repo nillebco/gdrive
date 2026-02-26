@@ -127,7 +127,7 @@ class TestLoadTokenWithServer:
             'refresh_token': 'refresh_token_123',
             'token_uri': 'https://oauth2.googleapis.com/token',
             'expiry': expiry,
-            'scopes': ['https://www.googleapis.com/auth/drive']
+            'scopes': ['https://www.googleapis.com/auth/drive.file']
         }
         token_path.write_text(json.dumps(token_data))
         
@@ -145,7 +145,7 @@ class TestLoadTokenWithServer:
             'refresh_token': 'refresh_token_123',
             'token_uri': 'https://oauth2.googleapis.com/token',
             'expiry': expiry,
-            'scopes': ['https://www.googleapis.com/auth/drive']
+            'scopes': ['https://www.googleapis.com/auth/drive.file']
         }
         token_path.write_text(json.dumps(token_data))
         
@@ -167,7 +167,7 @@ class TestFetchTokenFromServer:
             'refresh_token': 'refresh_token_123',
             'token_uri': 'https://oauth2.googleapis.com/token',
             'expiry': expiry,
-            'scopes': ['https://www.googleapis.com/auth/drive']
+            'scopes': ['https://www.googleapis.com/auth/drive.file']
         }
         token_path.write_text(json.dumps(token_data))
         
@@ -186,7 +186,7 @@ class TestFetchTokenFromServer:
             'refresh_token': 'refresh_token_123',
             'token_uri': 'https://oauth2.googleapis.com/token',
             'expiry': expiry,
-            'scopes': ['https://www.googleapis.com/auth/drive']
+            'scopes': ['https://www.googleapis.com/auth/drive.file']
         }
         token_path.write_text(json.dumps(token_data))
         

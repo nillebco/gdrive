@@ -623,7 +623,7 @@ The OAuth token is stored in `token.json` with the following structure:
   "token": "ya29...",
   "refresh_token": "1//...",
   "token_uri": "https://oauth2.googleapis.com/token",
-  "scopes": ["https://www.googleapis.com/auth/drive"],
+  "scopes": ["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/userinfo.email", "openid"],
   "account_email": "user@example.com",
   "issuer": "https://accounts.google.com",
   "token_server": "http://localhost:8080"

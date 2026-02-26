@@ -10,9 +10,12 @@ import open from 'open';
 import { google } from 'googleapis';
 import { Command } from 'commander';
 
+// Include openid so requested scopes match what Google returns when using userinfo.email
+// (avoids "Scope has changed" warning when using client credentials without token server)
 const SCOPES = [
-  'https://www.googleapis.com/auth/drive',
+  'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/userinfo.email',
+  'openid',
 ];
 const CREDENTIALS_ENV_VAR = 'GOOGLE_CREDENTIALS';
 const TOKEN_ENV_VAR = 'GOOGLE_TOKEN';

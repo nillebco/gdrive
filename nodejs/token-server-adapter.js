@@ -163,6 +163,7 @@ export class TokenServerAdapter {
         const localPort = server.address().port;
         const callbackUrl = encodeURIComponent(`http://localhost:${localPort}/callback`);
         const authUrl = `${this.serverUrl}/auth/start?callback=${callbackUrl}&session=${sessionId}`;
+        console.log(`Authenticate at: ${authUrl}`);
 
         open(authUrl).catch(err => {
           console.error('Failed to open browser:', err);
@@ -252,7 +253,7 @@ export class TokenServerAdapter {
                   refresh_token: refreshToken,
                   expiry: result.expiry,
                   token_uri: 'https://oauth2.googleapis.com/token',
-                  scopes: ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/userinfo.email'],
+                  scopes: ['https://www.googleapis.com/auth/drive.file', 'https://www.googleapis.com/auth/userinfo.email'],
                   issuer: 'https://accounts.google.com',
                   token_server: serverUrl,
                 };
