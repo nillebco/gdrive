@@ -1505,28 +1505,43 @@ def _refresh_token_from_server(server_url: str, refresh_token: str) -> Optional[
         return None
 
 
-def _fetch_token_from_server(server_url: str, token_path: Optional[str] = None) -> None:
+def _fetch_token_from_server(
+    server_url: str,
+    token_path: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+    force: bool = False,
+) -> None:
     """Fetch token from a token server.
-    
+
     This function uses the TokenServerAdapter to support multiple server types.
+
+    Args:
+        server_url: Token server URL.
+        token_path: Path to save/load the token.
+        refresh_token: Optional refresh token to exchange non-interactively
+            (skips the browser prompt for Next.js servers).
+        force: If True, always (re)provision even when a valid token exists.
     """
     from token_server_adapter import create_adapter
-    
-    # Check if we already have a valid token
-    existing_token = _load_token(token_path, token_server=server_url)
-    if existing_token and existing_token.valid:
-        return
-    
-    # If token exists but is expired, try to refresh via server
-    if existing_token and existing_token.expired and existing_token.refresh_token:
-        refreshed_creds = _refresh_token_via_server(token_path, server_url)
-        if refreshed_creds and refreshed_creds.valid:
+
+    # A supplied refresh token always (re)provisions — the caller is explicitly
+    # replacing whatever is on disk.
+    if not refresh_token and not force:
+        # Check if we already have a valid token
+        existing_token = _load_token(token_path, token_server=server_url)
+        if existing_token and existing_token.valid:
             return
-    
+
+        # If token exists but is expired, try to refresh via server
+        if existing_token and existing_token.expired and existing_token.refresh_token:
+            refreshed_creds = _refresh_token_via_server(token_path, server_url)
+            if refreshed_creds and refreshed_creds.valid:
+                return
+
     # Fetch new token using adapter
     adapter = create_adapter(server_url)
-    token_data = adapter.fetch_token_interactive(token_path)
-    
+    token_data = adapter.fetch_token_interactive(token_path, refresh_token=refresh_token)
+
     # Save the token
     path = token_path or DEFAULT_TOKEN_PATH
     with open(path, 'w') as f:
@@ -1849,6 +1864,14 @@ def login(
             help="URL of token server to fetch OAuth token from (or set OAUTH_TOKEN_SERVER env var)"
         )
     ] = None,
+    refresh_token: Annotated[
+        Optional[str],
+        typer.Option(
+            "--refresh-token",
+            help="Exchange this refresh token non-interactively via the token server "
+                 "(or set the OGD_REFRESH_TOKEN env var). Skips the browser prompt."
+        )
+    ] = None,
     force: Annotated[
         bool,
         typer.Option(
@@ -1868,11 +1891,13 @@ def login(
         python main.py login
         python main.py login --force
         python main.py login --token-server http://your-server:8080
+        python main.py login --token-server https://ogd.richardxiong.com --refresh-token 1//...
     """
     # If token-server is provided (via CLI or env var), fetch token from server
     server_url = _get_token_server(token_server)
     if server_url:
-        _fetch_token_from_server(server_url, token_path)
+        refresh_token = refresh_token or os.environ.get("OGD_REFRESH_TOKEN")
+        _fetch_token_from_server(server_url, token_path, refresh_token=refresh_token, force=force)
         account_email = _get_stored_account_email(token_path)
         if account_email:
             print(f"Logged in as: {account_email}")

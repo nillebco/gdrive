@@ -71,13 +71,18 @@ class TokenServerAdapter:
         self._server_type = "gdrive"
         return self._server_type
     
-    def fetch_token_interactive(self, token_path: Optional[str] = None) -> Dict[str, Any]:
+    def fetch_token_interactive(
+        self, token_path: Optional[str] = None, refresh_token: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
-        Fetch a new OAuth token by opening a browser for user authentication.
-        
+        Fetch a new OAuth token, either non-interactively from a supplied refresh
+        token or by opening a browser for user authentication.
+
         Args:
             token_path: Path where the token will be saved (for logging purposes)
-            
+            refresh_token: A refresh token to exchange directly (non-interactive).
+                When provided for a Next.js server, the browser prompt is skipped.
+
         Returns:
             Token data in standardized format with keys:
             - token: access token
@@ -89,11 +94,11 @@ class TokenServerAdapter:
             - token_server: URL of token server that issued the token
         """
         server_type = self.detect_server_type()
-        
+
         if server_type == "gdrive":
             return self._fetch_token_gdrive_server()
         elif server_type == "nextjs":
-            return self._fetch_token_nextjs_server()
+            return self._fetch_token_nextjs_server(refresh_token)
         else:
             raise RuntimeError(f"Unknown server type: {server_type}")
     
@@ -191,101 +196,127 @@ class TokenServerAdapter:
         else:
             raise RuntimeError("Failed to receive token")
     
-    def _fetch_token_nextjs_server(self) -> Dict[str, Any]:
+    def _build_token_from_refresh(self, refresh_token: str) -> Dict[str, Any]:
+        """Exchange a Next.js-issued refresh token for a full token payload.
+
+        Raises RuntimeError with an actionable message if the exchange fails
+        (most commonly because the refresh token was issued by a different
+        OAuth client than the one this server uses).
         """
-        Fetch token from Next.js server using manual web flow.
-        
+        refresh_token = (refresh_token or "").strip()
+        if not refresh_token:
+            raise RuntimeError("No refresh token provided.")
+        if not refresh_token.startswith("1//"):
+            raise RuntimeError(
+                "That doesn't look like a Google refresh token (they start with '1//'). "
+                "Copy it exactly as shown by the token server."
+            )
+
+        result = self._refresh_token_nextjs_server(refresh_token)
+        if not result or "token" not in result:
+            raise RuntimeError(
+                f"{self.server_url} could not exchange this refresh token. "
+                "This usually means the token was issued by a different OAuth client "
+                f"(each token server has its own). Re-provision a refresh token from "
+                f"{self.server_url} and try again."
+            )
+
+        return {
+            "token": result["token"],
+            "refresh_token": refresh_token,
+            "expiry": result["expiry"],
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "scopes": ["https://www.googleapis.com/auth/drive.file"],
+            "issuer": "https://accounts.google.com",
+            "token_server": self.server_url,
+        }
+
+    def _fetch_token_nextjs_server(
+        self, refresh_token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Fetch token from Next.js server.
+
         Note: Next.js servers are designed as web applications where OAuth happens
         in the browser. The redirect_uri must be pre-registered and points to the
-        website, not a CLI callback. Therefore, we use a semi-manual flow:
-        
+        website, not a CLI callback. Therefore, when no refresh token is supplied
+        we use a semi-manual flow:
+
         1. Open the Next.js website in browser
         2. User completes OAuth in browser
-        3. Wait for user to provide the token
+        3. User pastes the displayed refresh token
+
+        If ``refresh_token`` is supplied (e.g. via ``login --refresh-token`` or the
+        ``OGD_REFRESH_TOKEN`` env var), the browser step is skipped entirely.
         """
+        # Non-interactive path: a token was supplied up front.
+        if refresh_token:
+            return self._build_token_from_refresh(refresh_token)
+
+        import sys
+
+        # Without an interactive terminal we cannot prompt for a paste. Fail loud
+        # with guidance instead of spinning on EOF forever.
+        if not sys.stdin.isatty():
+            raise RuntimeError(
+                f"{self.server_url} needs a refresh token, but stdin is not interactive. "
+                f"Sign in at {self.server_url}, copy the refresh token, and pass it via "
+                "`login --refresh-token <token>` or the OGD_REFRESH_TOKEN env var."
+            )
+
         print(f"\n{'='*70}")
-        print(f"MANUAL AUTHENTICATION REQUIRED")
+        print("MANUAL AUTHENTICATION REQUIRED")
         print(f"{'='*70}\n")
-        print(f"The Next.js server at {self.server_url} requires manual authentication.")
-        print(f"\nSteps:")
+        print(f"The server at {self.server_url} requires manual authentication.")
+        print("\nSteps:")
         print(f"  1. Opening browser to {self.server_url}...")
-        print(f"  2. Sign in with Google when prompted")
-        print(f"  3. Copy the displayed refresh token")
-        print(f"  4. Return here to paste it\n")
-        
-        # Open the Next.js website
+        print("  2. Sign in with Google when prompted")
+        print("  3. Copy the displayed refresh token")
+        print("  4. Return here to paste it\n")
+
         webbrowser.open(self.server_url)
-        
-        # Wait a moment for browser to open
+
         import time
         time.sleep(2)
-        
+
         print("Waiting for you to complete authentication in the browser...")
-        print("\nOnce you've signed in and see your refresh token:")
-        
-        # Prompt for refresh token input
+
+        # Prompt for refresh token input. Bail after a bounded number of empty
+        # reads so a closed/redirected stdin can never cause an infinite loop.
+        empty_reads = 0
         while True:
             print("\nPaste the refresh token from the browser (or press Ctrl+C to cancel):")
             print("(It should look like: 1//01abc...xyz)\n")
-            
             try:
-                import sys
                 print("→ ", end="", flush=True)
-                
-                # Read the refresh token
-                refresh_token = sys.stdin.readline().strip()
-                
-                if not refresh_token:
+                line = sys.stdin.readline()
+                if line == "":  # EOF
+                    raise RuntimeError(
+                        "stdin closed before a refresh token was provided. "
+                        "Use `login --refresh-token <token>` instead."
+                    )
+                token = line.strip()
+                if not token:
+                    empty_reads += 1
+                    if empty_reads >= 3:
+                        raise RuntimeError("No refresh token provided after several attempts.")
                     print("\n✗ Error: No token provided")
                     continue
-                
-                # Validate it looks like a refresh token (basic check)
-                if not refresh_token.startswith('1//'):
-                    print("\n✗ Error: This doesn't look like a valid refresh token")
-                    print("Refresh tokens typically start with '1//'")
-                    print("Please copy the token exactly as shown in the browser")
-                    continue
-                
+
                 print("\n⏳ Exchanging refresh token for access token...")
-                
-                # Use the server's /api/access endpoint to get an access token
                 try:
-                    result = self._refresh_token_nextjs_server(refresh_token)
-                    
-                    if result and 'token' in result:
-                        # Build complete token data
-                        token_data = {
-                            'token': result['token'],
-                            'refresh_token': refresh_token,
-                            'expiry': result['expiry'],
-                            'token_uri': 'https://oauth2.googleapis.com/token',
-                            'scopes': ['https://www.googleapis.com/auth/drive.file'],
-                            'issuer': 'https://accounts.google.com',
-                            'token_server': self.server_url,
-                        }
-                        
-                        print("✓ Token validated and access token obtained successfully!")
-                        return token_data
-                    else:
-                        print("\n✗ Error: Failed to get access token from refresh token")
-                        print("The refresh token may be invalid or expired")
-                        print("Please try authenticating again in the browser")
-                        continue
-                        
-                except Exception as e:
-                    print(f"\n✗ Error: Failed to exchange refresh token: {e}")
+                    token_data = self._build_token_from_refresh(token)
+                    print("✓ Token validated and access token obtained successfully!")
+                    return token_data
+                except RuntimeError as e:
+                    print(f"\n✗ {e}")
                     print("Please try authenticating again in the browser")
                     continue
-                    
             except KeyboardInterrupt:
                 print("\n\nAuthentication cancelled by user.")
                 raise RuntimeError("Authentication cancelled")
-            except Exception as e:
-                print(f"\n✗ Error: {e}")
-                print("Please try again")
-                continue
-    
-    
+
+
     def _refresh_token_gdrive_server(self, refresh_token: str) -> Optional[Dict[str, Any]]:
         """Refresh token using gdrive server /auth/refresh endpoint."""
         refresh_url = f"{self.server_url}/auth/refresh"
@@ -344,11 +375,22 @@ class TokenServerAdapter:
                     'expiry': expiry.isoformat(),
                 }
         except urllib.error.HTTPError as e:
-            try:
-                error_body = e.read().decode('utf-8')
-                print(f"Token refresh failed: {error_body}")
-            except Exception:
-                print(f"Token refresh failed with HTTP {e.code}")
+            # The Next.js /api/access route has no error handling: when Google
+            # rejects the refresh token (e.g. it was minted by a different OAuth
+            # client) it bubbles up as a bare HTTP 500 HTML page. Translate that
+            # into an actionable hint rather than dumping the HTML.
+            if e.code >= 500:
+                print(
+                    f"Token refresh failed (HTTP {e.code} from {access_url}). "
+                    "The server rejected this refresh token — most likely it was "
+                    "issued by a different OAuth client than this token server uses. "
+                    f"Re-provision a refresh token from {self.server_url}."
+                )
+            else:
+                try:
+                    print(f"Token refresh failed: {e.read().decode('utf-8')[:300]}")
+                except Exception:
+                    print(f"Token refresh failed with HTTP {e.code}")
             return None
         except Exception as e:
             print(f"Token refresh failed: {e}")
