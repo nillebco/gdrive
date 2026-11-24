@@ -1,3 +1,6 @@
+---
+_organized: true
+---
 # AGENTS
 
 This software is about managing (uploading and exporting) files to/from Google Drive.

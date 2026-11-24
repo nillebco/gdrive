@@ -1,3 +1,6 @@
+---
+_organized: true
+---
 # gdrive
 
 A CLI tool for Google Drive file operations — upload files and export Google Workspace documents.
