@@ -1634,6 +1634,10 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                     prompt='consent'
                 )
                 
+                # google-auth-oauthlib >= 1.3 enables PKCE by default; the callback
+                # builds a fresh Flow, so keep the verifier for the token exchange.
+                pending_sessions[session_id]['code_verifier'] = flow.code_verifier
+
                 self._send_redirect(auth_url)
                 return
             
@@ -1660,6 +1664,8 @@ class TokenServerHandler(BaseHTTPRequestHandler):
                         scopes=SCOPES,
                         redirect_uri=redirect_uri
                     )
+                    pending = pending_sessions.get(state) or {}
+                    flow.code_verifier = pending.get('code_verifier')
                     flow.fetch_token(code=code)
                     creds = flow.credentials
                     
